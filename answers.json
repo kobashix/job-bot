@@ -1,0 +1,69 @@
+{
+  "work_authorization": {
+    "default": "Yes",
+    "aliases": [
+      "authorized to work",
+      "legally authorized",
+      "eligible to work"
+    ]
+  },
+  "visa_sponsorship": {
+    "default": "No",
+    "aliases": [
+      "require sponsorship",
+      "visa",
+      "h1b"
+    ]
+  },
+  "relocation": {
+    "default": "Yes",
+    "aliases": [
+      "willing to relocate",
+      "relocate",
+      "move for job"
+    ]
+  },
+  "commute_distance": {
+    "default": "Yes",
+    "aliases": [
+      "commute",
+      "distance",
+      "travel"
+    ]
+  },
+  "education_level": {
+    "default": "Master's",
+    "aliases": [
+      "highest level of education",
+      "education completed"
+    ]
+  },
+  "certifications": {
+    "default": "CPA",
+    "aliases": [
+      "certification",
+      "license"
+    ]
+  },
+  "experience_years": {
+    "default": "10",
+    "aliases": [
+      "years of experience",
+      "how many years"
+    ]
+  },
+  "gender": {
+    "default": "Male",
+    "aliases": [
+      "gender",
+      "sex"
+    ]
+  },
+  "race": {
+    "default": "White",
+    "aliases": [
+      "race",
+      "ethnicity"
+    ]
+  }
+}

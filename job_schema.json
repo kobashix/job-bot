@@ -1,0 +1,20 @@
+{
+  "job_id": "string",
+  "job_url": "string",
+  "title": "string",
+  "company": "string",
+  "location": "string",
+
+  "source": "indeed",
+  "external": false,
+
+  "status": "new",
+  "applied": false,
+
+  "last_attempt": null,
+  "failure_reason": null,
+
+  "attempts": 0,
+  "created_at": null,
+  "updated_at": null
+}
