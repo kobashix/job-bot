@@ -95,7 +95,7 @@ def main(limit=10):
             elif "invalid" in output.lower() or "404" in output.lower():
                 mark(url, "invalid", "invalid_job")
             else:
-                fallback_reason = output[-500:] if output else f"unknown_failure_returncode_{returncode}"
+                fallback_reason = output[-500:] if output else f"unclassified_failure_returncode_{returncode}"
                 mark(url, "failed", fallback_reason)
 
         time.sleep(8)

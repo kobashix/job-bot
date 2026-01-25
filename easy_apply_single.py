@@ -40,11 +40,23 @@ CAPTCHA_IFRAME_SELECTORS = [
     "iframe[src*='captcha' i]",
     "iframe[src*='recaptcha' i]",
     "iframe[src*='hcaptcha' i]",
+    "iframe[src*='api2/anchor' i]",
+    "iframe[src*='api2/bframe' i]",
     "iframe[title*='captcha' i]",
     "iframe[title*='recaptcha' i]",
     "iframe[title*='hcaptcha' i]",
     "div[aria-label*='captcha' i]",
+    "textarea[name='g-recaptcha-response' i]",
+    "textarea[name='h-captcha-response' i]",
+    "input[name='g-recaptcha-response' i]",
+    "input[name='h-captcha-response' i]",
+    ".grecaptcha-badge",
+    ".h-captcha",
+    "div[id*='recaptcha' i]",
+    "div[class*='recaptcha' i]",
 ]
+CAPTCHA_TEXT_LOCATOR = "text=/i'm not a robot|verify you are human|security check|captcha/i"
+CAPTCHA_CHALLENGE_LOCATOR = "iframe[title*='challenge' i], iframe[src*='challenge' i]"
 
 LAST_ACTION = {"label": None, "fn": None}
 LAST_PROGRESS = {"url": None, "value": None, "timestamp": None}
@@ -85,6 +97,19 @@ ANSWERS = load_answers()
 def slow_wait(sec=2):
     time.sleep(sec)
 
+def locator_has_visible(locator, limit=5):
+    try:
+        count = min(locator.count(), limit)
+    except Exception:
+        return False
+    for i in range(count):
+        try:
+            if locator.nth(i).is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
 def mark_captcha_pending(reason):
     log(f"[CAPTCHA] {reason}")
     db_update(JOB_URL, "captcha_pending", reason)
@@ -110,14 +135,31 @@ def detect_captcha(page, reason="captcha_detected"):
         title = page.title().lower()
     except Exception as exc:
         log(f"[WARN] Failed reading page text: {exc}")
+    text_locator = page.locator(CAPTCHA_TEXT_LOCATOR)
+    if locator_has_visible(text_locator):
+        mark_captcha_pending(f"{reason}:visible_text")
+        prompt_captcha_and_retry()
+        return True
     for t in BLOCK_TEXTS:
-        if t in body or t in title:
-            mark_captcha_pending(f"{reason}:{t}")
-            prompt_captcha_and_retry()
-            return True
+        if t in ["captcha"]:
+            if t in body or t in title:
+                if locator_has_visible(text_locator) or page.locator(CAPTCHA_CHALLENGE_LOCATOR).count():
+                    mark_captcha_pending(f"{reason}:{t}")
+                    prompt_captcha_and_retry()
+                    return True
+        else:
+            if t in body or t in title:
+                mark_captcha_pending(f"{reason}:{t}")
+                prompt_captcha_and_retry()
+                return True
     captcha_frames = page.locator(", ".join(CAPTCHA_IFRAME_SELECTORS))
-    if captcha_frames.count():
-        mark_captcha_pending(f"{reason}:iframe")
+    if captcha_frames.count() and locator_has_visible(captcha_frames):
+        mark_captcha_pending(f"{reason}:iframe_visible")
+        prompt_captcha_and_retry()
+        return True
+    challenge_frames = page.locator(CAPTCHA_CHALLENGE_LOCATOR)
+    if challenge_frames.count():
+        mark_captcha_pending(f"{reason}:challenge_frame")
         prompt_captcha_and_retry()
         return True
     return False
@@ -173,6 +215,11 @@ def click_any(page, labels, timeout=5000):
                 loc.first.scroll_into_view_if_needed()
                 LAST_ACTION["label"] = label
                 LAST_ACTION["fn"] = lambda l=loc.first, t=timeout: l.click(timeout=t, force=True)
+                try:
+                    if not loc.first.is_enabled():
+                        log(f"[WARN] Button disabled: {label}")
+                except Exception as exc:
+                    log(f"[WARN] Button enabled check failed for {label}: {exc}")
                 if "submit" in label.lower():
                     log("[WAIT] Slowing down before final submission")
                     slow_wait(4)
@@ -408,6 +455,13 @@ def check_for_stall(page, threshold=20):
     if url == LAST_PROGRESS["url"] and value == LAST_PROGRESS["value"] and now - LAST_PROGRESS["timestamp"] > threshold:
         log("[STALL] No progress detected, rescanning for actions/captcha")
         detect_captcha(page, reason="stall_detected")
+        buttons = page.locator("button:has-text('Continue'), button:has-text('Review'), button:has-text('Submit')")
+        if buttons.count():
+            try:
+                if not buttons.first.is_enabled():
+                    log("[STALL] Action button present but disabled")
+            except Exception as exc:
+                log(f"[WARN] Action button enabled check failed: {exc}")
         click_any(page, ["Continue", "Review", "Submit", "Submit your application"], timeout=8000)
         update_progress_marker(page)
     elif url != LAST_PROGRESS["url"] or value != LAST_PROGRESS["value"]:
