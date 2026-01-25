@@ -5,7 +5,16 @@ import sys
 
 DB_PATH = "jobs.db"
 PYTHON = sys.executable
-RETRYABLE_STATUSES = ("applied", "external", "blocked", "failed", "invalid", "no_apply", "permanent_failed")
+RETRYABLE_STATUSES = (
+    "applied",
+    "external",
+    "blocked",
+    "failed",
+    "invalid",
+    "no_apply",
+    "permanent_failed",
+    "captcha_pending",
+)
 
 def fetch_jobs(limit):
     attempts = 0
@@ -17,7 +26,7 @@ def fetch_jobs(limit):
                     SELECT job_url
                     FROM jobs
                     WHERE applied = 0
-                      AND (status IS NULL OR status NOT IN (?, ?, ?, ?, ?, ?, ?))
+                      AND (status IS NULL OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?))
                     LIMIT ?
                     """,
                     (*RETRYABLE_STATUSES, limit),
@@ -82,7 +91,7 @@ def main(limit=10):
             if "external" in output.lower():
                 mark(url, "external", "company_site")
             elif "captcha" in output.lower():
-                mark(url, "blocked", "captcha")
+                mark(url, "captcha_pending", "captcha_pending")
             elif "invalid" in output.lower() or "404" in output.lower():
                 mark(url, "invalid", "invalid_job")
             else:

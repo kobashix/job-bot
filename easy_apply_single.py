@@ -36,6 +36,18 @@ EXTERNAL_HOST_KEYWORDS = [
     "brassring",
     "successfactors",
 ]
+CAPTCHA_IFRAME_SELECTORS = [
+    "iframe[src*='captcha' i]",
+    "iframe[src*='recaptcha' i]",
+    "iframe[src*='hcaptcha' i]",
+    "iframe[title*='captcha' i]",
+    "iframe[title*='recaptcha' i]",
+    "iframe[title*='hcaptcha' i]",
+    "div[aria-label*='captcha' i]",
+]
+
+LAST_ACTION = {"label": None, "fn": None}
+LAST_PROGRESS = {"url": None, "value": None, "timestamp": None}
 
 def log(msg):
     print(msg, flush=True)
@@ -73,7 +85,24 @@ ANSWERS = load_answers()
 def slow_wait(sec=2):
     time.sleep(sec)
 
-def detect_captcha(page):
+def mark_captcha_pending(reason):
+    log(f"[CAPTCHA] {reason}")
+    db_update(JOB_URL, "captcha_pending", reason)
+
+def prompt_captcha_and_retry():
+    log("[CAPTCHA] Solve captcha in browser, then press ENTER to continue")
+    try:
+        input()
+    except EOFError:
+        log("[CAPTCHA] No stdin available to continue")
+    if LAST_ACTION["fn"] is not None:
+        log(f"[CAPTCHA] Retrying last action: {LAST_ACTION['label']}")
+        try:
+            LAST_ACTION["fn"]()
+        except Exception as exc:
+            log(f"[WARN] Retry action failed after captcha: {exc}")
+
+def detect_captcha(page, reason="captcha_detected"):
     body = ""
     title = ""
     try:
@@ -83,14 +112,15 @@ def detect_captcha(page):
         log(f"[WARN] Failed reading page text: {exc}")
     for t in BLOCK_TEXTS:
         if t in body or t in title:
-            log(f"[CAPTCHA] Detected blocking page: {t}")
-            db_update(JOB_URL, "blocked", "captcha")
-            sys.exit(20)
-    captcha_frames = page.locator("iframe[src*='captcha' i], iframe[title*='captcha' i], div[aria-label*='captcha' i]")
+            mark_captcha_pending(f"{reason}:{t}")
+            prompt_captcha_and_retry()
+            return True
+    captcha_frames = page.locator(", ".join(CAPTCHA_IFRAME_SELECTORS))
     if captcha_frames.count():
-        log("[CAPTCHA] Detected captcha iframe")
-        db_update(JOB_URL, "blocked", "captcha")
-        sys.exit(20)
+        mark_captcha_pending(f"{reason}:iframe")
+        prompt_captcha_and_retry()
+        return True
+    return False
 
 def detect_external(page):
     current_url = page.url
@@ -141,6 +171,11 @@ def click_any(page, labels, timeout=5000):
         if loc.count():
             try:
                 loc.first.scroll_into_view_if_needed()
+                LAST_ACTION["label"] = label
+                LAST_ACTION["fn"] = lambda l=loc.first, t=timeout: l.click(timeout=t, force=True)
+                if "submit" in label.lower():
+                    log("[WAIT] Slowing down before final submission")
+                    slow_wait(4)
                 loc.first.click(timeout=timeout, force=True)
                 log(f"[CLICK] {label}")
                 return True
@@ -153,10 +188,20 @@ def click_any(page, labels, timeout=5000):
                     return True
                 except Exception as retry_exc:
                     log(f"[WARN] Retry click failed on {label}: {retry_exc}")
+                    if detect_captcha(page, reason="blocked_click"):
+                        return True
     return False
 
 def handle_resume_screen(page):
-    if page.locator("text=Add a resume for the employer").count() or page.locator("text=Use your Indeed Resume").count():
+    resume_banner = page.locator("text=Add a resume for the employer")
+    resume_card = page.locator("text=Use your Indeed Resume")
+    upload_option = page.locator("text=Upload a resume")
+    if resume_banner.count() or resume_card.count() or upload_option.count():
+        log("[RESUME] Waiting for resume options")
+        try:
+            page.wait_for_selector("text=Use your Indeed Resume, text=Upload a resume", timeout=20000)
+        except Exception as exc:
+            log(f"[WARN] Resume options not visible yet: {exc}")
         log("[RESUME] Selecting Indeed resume")
         card = page.locator("text=Use your Indeed Resume").first
         try:
@@ -164,21 +209,59 @@ def handle_resume_screen(page):
             card.click(force=True)
         except Exception as exc:
             log(f"[WARN] Resume card click failed: {exc}")
+            try:
+                card.scroll_into_view_if_needed()
+                card.click(force=True)
+            except Exception as retry_exc:
+                log(f"[WARN] Resume card retry failed: {retry_exc}")
         slow_wait(2)
+        try:
+            page.wait_for_selector("button:has-text('Continue')", timeout=20000)
+        except Exception as exc:
+            log(f"[WARN] Continue button not visible yet: {exc}")
         click_any(page, ["Continue"], timeout=20000)
 
 def handle_radios(page):
-    fieldsets = page.locator("fieldset")
-    for i in range(fieldsets.count()):
-        fs = fieldsets.nth(i)
-        radios = fs.locator("input[type='radio']")
-        if radios.count():
+    radios = page.locator("input[type='radio']")
+    total = radios.count()
+    groups = {}
+    for i in range(total):
+        radio = radios.nth(i)
+        try:
+            name = radio.get_attribute("name") or f"_unnamed_{i}"
+            groups.setdefault(name, []).append(radio)
+        except Exception as exc:
+            log(f"[WARN] Radio group detection failed: {exc}")
+    for name, group in groups.items():
+        try:
+            if any(r.is_checked() for r in group):
+                continue
+            selected = None
+            for radio in group:
+                try:
+                    if not radio.is_visible() or not radio.is_enabled():
+                        continue
+                    selected = radio
+                    break
+                except Exception as exc:
+                    log(f"[WARN] Radio visibility check failed: {exc}")
+            if selected is None:
+                continue
+            label_text = ""
             try:
-                radios.first.scroll_into_view_if_needed()
-                radios.first.check(force=True)
-                log("[RADIO] Defaulted first option")
-            except Exception as exc:
-                log(f"[WARN] Radio default failed: {exc}")
+                label_text = selected.evaluate(
+                    """e => {
+                        const label = e.closest('label') || document.querySelector(`label[for='${e.id}']`);
+                        return label ? label.innerText.trim() : '';
+                    }"""
+                )
+            except Exception:
+                label_text = ""
+            selected.scroll_into_view_if_needed()
+            selected.check(force=True)
+            log(f"[RADIO] Selected first option for group {name}: {label_text or 'unlabeled'}")
+        except Exception as exc:
+            log(f"[WARN] Radio default failed for group {name}: {exc}")
 
 def handle_special_radios(page):
     selections = [
@@ -220,6 +303,58 @@ def extract_context(el):
         label = ""
     return label
 
+def handle_distance_questions(page):
+    keywords = ["commute", "commuting", "distance", "travel"]
+    try:
+        body = page.inner_text("body").lower()
+    except Exception as exc:
+        log(f"[WARN] Failed reading page text: {exc}")
+        body = ""
+    if not any(k in body for k in keywords):
+        return
+    log("[DISTANCE] Detected commuting question")
+    radios = page.locator("input[type='radio']")
+    for i in range(radios.count()):
+        radio = radios.nth(i)
+        try:
+            label_text = radio.evaluate(
+                """e => {
+                    const label = e.closest('label') || document.querySelector(`label[for='${e.id}']`);
+                    return label ? label.innerText.trim().toLowerCase() : '';
+                }"""
+            )
+        except Exception:
+            label_text = ""
+        if "no" in label_text:
+            try:
+                radio.scroll_into_view_if_needed()
+                radio.check(force=True)
+                log(f"[DISTANCE] Selected radio: {label_text}")
+                return
+            except Exception as exc:
+                log(f"[WARN] Distance radio select failed: {exc}")
+    select = page.locator("select")
+    if select.count():
+        try:
+            select.first.scroll_into_view_if_needed()
+            select.first.select_option(label="No")
+            log("[DISTANCE] Selected dropdown: No")
+            return
+        except Exception as exc:
+            log(f"[WARN] Distance dropdown select failed: {exc}")
+    inputs = page.locator("input[type='text'], textarea")
+    for i in range(inputs.count()):
+        el = inputs.nth(i)
+        context = extract_context(el)
+        if any(k in context for k in keywords):
+            try:
+                el.scroll_into_view_if_needed()
+                el.fill("No")
+                log("[DISTANCE] Filled input: No")
+                return
+            except Exception as exc:
+                log(f"[WARN] Distance input fill failed: {exc}")
+
 def handle_inputs(page):
     inputs = page.locator("input[type='text'], textarea")
     for i in range(inputs.count()):
@@ -244,6 +379,40 @@ def handle_inputs(page):
 def find_apply_button(page):
     return click_any(page, ["Apply", "Apply now", "Apply on company site"], timeout=15000)
 
+def update_progress_marker(page):
+    url = page.url
+    value = None
+    try:
+        progress = page.locator("[role='progressbar'], progress, [aria-valuenow]")
+        if progress.count():
+            value = progress.first.get_attribute("aria-valuenow") or progress.first.get_attribute("value")
+    except Exception as exc:
+        log(f"[WARN] Progress read failed: {exc}")
+    LAST_PROGRESS["url"] = url
+    LAST_PROGRESS["value"] = value
+    LAST_PROGRESS["timestamp"] = time.time()
+
+def check_for_stall(page, threshold=20):
+    if LAST_PROGRESS["timestamp"] is None:
+        update_progress_marker(page)
+        return
+    now = time.time()
+    url = page.url
+    value = None
+    try:
+        progress = page.locator("[role='progressbar'], progress, [aria-valuenow]")
+        if progress.count():
+            value = progress.first.get_attribute("aria-valuenow") or progress.first.get_attribute("value")
+    except Exception as exc:
+        log(f"[WARN] Progress read failed: {exc}")
+    if url == LAST_PROGRESS["url"] and value == LAST_PROGRESS["value"] and now - LAST_PROGRESS["timestamp"] > threshold:
+        log("[STALL] No progress detected, rescanning for actions/captcha")
+        detect_captcha(page, reason="stall_detected")
+        click_any(page, ["Continue", "Review", "Submit", "Submit your application"], timeout=8000)
+        update_progress_marker(page)
+    elif url != LAST_PROGRESS["url"] or value != LAST_PROGRESS["value"]:
+        update_progress_marker(page)
+
 try:
     with sync_playwright() as p:
         log("[INIT] Connecting to Chromium")
@@ -262,7 +431,7 @@ try:
         slow_wait(4)
 
         detect_invalid(page, response)
-        detect_captcha(page)
+        detect_captcha(page, reason="landing")
         detect_external(page)
 
         if not find_apply_button(page):
@@ -275,8 +444,9 @@ try:
             slow_wait(4)
 
             detect_invalid(page)
-            detect_captcha(page)
+            detect_captcha(page, reason=f"step_{step+1}")
             detect_external(page)
+            check_for_stall(page)
 
             body = page.inner_text("body").lower()
             if any(t in body for t in SUCCESS_TEXTS):
@@ -286,6 +456,7 @@ try:
 
             handle_resume_screen(page)
             handle_inputs(page)
+            handle_distance_questions(page)
             handle_radios(page)
             handle_special_radios(page)
 
