@@ -30,7 +30,7 @@ def fetch_jobs(limit):
                     SELECT job_url
                     FROM jobs
                     WHERE applied = 0
-                      AND (status IS NULL OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
+                      AND (status IS NULL OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
                     LIMIT ?
                     """,
                     (*RETRYABLE_STATUSES, limit),
