@@ -36,9 +36,14 @@ def save_job(conn, job):
                 status,
                 applied,
                 attempts,
+                last_attempt_at,
+                last_error,
                 created_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', 0, 0, datetime('now'), datetime('now'))
+                updated_at,
+                score,
+                decision,
+                notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', 0, 0, NULL, NULL, datetime('now'), datetime('now'), 0, 'apply', NULL)
         """, (
             job["job_id"],
             job["job_url"],
@@ -91,13 +96,27 @@ def extract_jobs(page):
 
         job_url = normalize_indeed_url(href)
         title = card.inner_text().split("\n")[0].strip()
+        location = "Unknown"
+        location_locators = [
+            "span[data-testid='text-location']",
+            ".companyLocation",
+            "div[data-testid='text-location']",
+        ]
+        for selector in location_locators:
+            loc = card.locator(selector)
+            if loc.count():
+                location = loc.first.inner_text().strip()
+                break
+        if "remote" not in location.lower():
+            print(f"⏭️ Skipping non-remote job: {title} ({location})")
+            continue
 
         jobs.append({
             "job_id": jk,
             "job_url": job_url,
             "title": title,
             "company": "Unknown",
-            "location": "Unknown",
+            "location": location,
             "is_external": 0
         })
 
