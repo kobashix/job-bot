@@ -2,6 +2,7 @@ import sys
 import time
 import json
 import sqlite3
+import config
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -35,6 +36,8 @@ EXTERNAL_HOST_KEYWORDS = [
     "taleo",
     "brassring",
     "successfactors",
+    "bamboohr",
+    "jobvite",
 ]
 CAPTCHA_IFRAME_SELECTORS = [
     "iframe[src*='captcha' i]",
@@ -58,24 +61,39 @@ CAPTCHA_IFRAME_SELECTORS = [
 CAPTCHA_TEXT_LOCATOR = "text=/i'm not a robot|verify you are human|security check|captcha/i"
 CAPTCHA_CHALLENGE_LOCATOR = "iframe[title*='challenge' i], iframe[src*='challenge' i]"
 
+EXTERNAL_BUTTON_LABELS = ["Apply on company site", "Apply externally"]
+EXTERNAL_ACTION_LABELS = ["Apply", "Next", "Continue"]
+EXTERNAL_FINAL_SUBMIT_LABELS = ["Submit application", "Finish", "Complete application"]
+
 LAST_ACTION = {"label": None, "fn": None}
 LAST_PROGRESS = {"url": None, "value": None, "timestamp": None}
 
 def log(msg):
     print(msg, flush=True)
 
-def db_update(job_url, status, reason=None):
+def db_update(job_url, status, reason=None, is_external=None):
     attempts = 0
     while True:
         try:
             with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                fields = [
+                    "applied = ?",
+                    "status = ?",
+                    "last_error = ?",
+                    "updated_at = CURRENT_TIMESTAMP",
+                ]
+                values = [1 if status == "applied" else 0, status, reason]
+                if is_external is not None:
+                    fields.append("is_external = ?")
+                    values.append(1 if is_external else 0)
+                values.append(job_url)
                 conn.execute(
-                    """
+                    f"""
                     UPDATE jobs
-                    SET applied = ?, status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
+                    SET {", ".join(fields)}
                     WHERE job_url = ?
                     """,
-                    (1 if status == "applied" else 0, status, reason, job_url),
+                    values,
                 )
                 conn.commit()
             return
@@ -97,6 +115,13 @@ ANSWERS = load_answers()
 def slow_wait(sec=2):
     time.sleep(sec)
 
+def format_external_reason(final_url, ats, reason):
+    ts = datetime.now().isoformat()
+    return f"{reason}|ats={ats}|url={final_url}|ts={ts}"
+
+def mark_external_site(final_url, ats, reason="external_detected"):
+    db_update(JOB_URL, "external", format_external_reason(final_url, ats, reason), is_external=True)
+
 def locator_has_visible(locator, limit=5):
     try:
         count = min(locator.count(), limit)
@@ -110,9 +135,9 @@ def locator_has_visible(locator, limit=5):
             continue
     return False
 
-def mark_captcha_pending(reason):
+def mark_captcha_pending(reason, is_external=False):
     log(f"[CAPTCHA] {reason}")
-    db_update(JOB_URL, "captcha_pending", reason)
+    db_update(JOB_URL, "captcha_pending", reason, is_external=is_external)
 
 def prompt_captcha_and_retry():
     log("[CAPTCHA] Solve captcha in browser, then press ENTER to continue")
@@ -127,7 +152,7 @@ def prompt_captcha_and_retry():
         except Exception as exc:
             log(f"[WARN] Retry action failed after captcha: {exc}")
 
-def detect_captcha(page, reason="captcha_detected"):
+def detect_captcha(page, reason="captcha_detected", is_external=False):
     body = ""
     title = ""
     try:
@@ -144,37 +169,106 @@ def detect_captcha(page, reason="captcha_detected"):
         if t in ["captcha"]:
             if t in body or t in title:
                 if locator_has_visible(text_locator) or page.locator(CAPTCHA_CHALLENGE_LOCATOR).count():
-                    mark_captcha_pending(f"{reason}:{t}")
+                    mark_captcha_pending(f"{reason}:{t}", is_external=is_external)
                     prompt_captcha_and_retry()
                     return True
         else:
             if t in body or t in title:
-                mark_captcha_pending(f"{reason}:{t}")
+                mark_captcha_pending(f"{reason}:{t}", is_external=is_external)
                 prompt_captcha_and_retry()
                 return True
     captcha_frames = page.locator(", ".join(CAPTCHA_IFRAME_SELECTORS))
     if captcha_frames.count() and locator_has_visible(captcha_frames):
-        mark_captcha_pending(f"{reason}:iframe_visible")
+        mark_captcha_pending(f"{reason}:iframe_visible", is_external=is_external)
         prompt_captcha_and_retry()
         return True
     challenge_frames = page.locator(CAPTCHA_CHALLENGE_LOCATOR)
     if challenge_frames.count():
-        mark_captcha_pending(f"{reason}:challenge_frame")
+        mark_captcha_pending(f"{reason}:challenge_frame", is_external=is_external)
         prompt_captcha_and_retry()
         return True
     return False
 
-def detect_external(page):
+def is_indeed_host(host):
+    return host.endswith("indeed.com") or host == "smartapply.indeed.com"
+
+def detect_ats(final_url, page):
+    lower_url = final_url.lower()
+    ats_map = [
+        ("workday", "Workday"),
+        ("greenhouse", "Greenhouse"),
+        ("lever", "Lever"),
+        ("icims", "iCIMS"),
+        ("paycom", "Paycom"),
+        ("adp", "ADP"),
+        ("bamboohr", "BambooHR"),
+        ("taleo", "Taleo"),
+        ("jobvite", "Jobvite"),
+    ]
+    for token, name in ats_map:
+        if token in lower_url:
+            return name
+    try:
+        body = page.inner_text("body").lower()
+    except Exception as exc:
+        log(f"[WARN] ATS detection failed: {exc}")
+        body = ""
+    for token, name in ats_map:
+        if token in body:
+            return name
+    return "unknown_external"
+
+def detect_external_context(page, context):
     current_url = page.url
     host = urlparse(current_url).netloc.lower()
-    if host and host != JOB_HOST and "indeed.com" not in host:
-        log(f"[EXTERNAL] Host changed: {host}")
-        db_update(JOB_URL, "external", f"host_change:{host}")
-        sys.exit(3)
+    if host and not is_indeed_host(host):
+        return {"page": page, "final_url": current_url, "reason": "host_change"}
+    for label in EXTERNAL_BUTTON_LABELS:
+        button = page.locator(f"button:has-text('{label}')")
+        if locator_has_visible(button):
+            return {"page": page, "final_url": current_url, "reason": f"button:{label}", "button": label}
+    for extra_page in context.pages:
+        try:
+            extra_url = extra_page.url
+        except Exception:
+            continue
+        extra_host = urlparse(extra_url).netloc.lower()
+        if extra_host and not is_indeed_host(extra_host):
+            return {"page": extra_page, "final_url": extra_url, "reason": "new_tab"}
     if any(k in host for k in EXTERNAL_HOST_KEYWORDS):
-        log(f"[EXTERNAL] Company site detected: {host}")
-        db_update(JOB_URL, "external", f"company_site:{host}")
-        sys.exit(3)
+        return {"page": page, "final_url": current_url, "reason": "keyword_host"}
+    return None
+
+def detect_invalid(page, response=None):
+    status = None
+    if response is not None:
+        try:
+            status = response.status
+        except Exception:
+            status = None
+    if status and status >= 400:
+        log(f"[INVALID] HTTP status {status}")
+        db_update(JOB_URL, "invalid", f"http_status_{status}")
+        sys.exit(12)
+    try:
+        body = page.inner_text("body").lower()
+        title = page.title().lower()
+    except Exception as exc:
+        log(f"[WARN] Failed reading page text: {exc}")
+        return
+    invalid_texts = [
+        "job expired",
+        "job is no longer available",
+        "job has expired",
+        "this job is no longer available",
+        "404",
+        "page not found",
+    ]
+    for text in invalid_texts:
+        if text in body or text in title:
+            log(f"[INVALID] {text}")
+            db_update(JOB_URL, "invalid", f"invalid_text:{text}")
+            sys.exit(12)
 
 def detect_invalid(page, response=None):
     status = None
@@ -426,6 +520,306 @@ def handle_inputs(page):
 def find_apply_button(page):
     return click_any(page, ["Apply", "Apply now", "Apply on company site"], timeout=15000)
 
+def external_capture_screenshot(page, reason):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = config.ARTIFACT_DIR / f"external_failure_{timestamp}.png"
+    try:
+        page.screenshot(path=str(filename), full_page=True)
+        log(f"[EXTERNAL] Screenshot saved: {filename} ({reason})")
+    except Exception as exc:
+        log(f"[WARN] Screenshot capture failed: {exc}")
+
+def external_fail(status, reason, page, final_url, ats):
+    external_capture_screenshot(page, reason)
+    db_update(JOB_URL, status, format_external_reason(final_url, ats, reason), is_external=True)
+    log(f"[EXTERNAL] Failure: {status} - {reason}")
+    sys.exit(30)
+
+def external_confirm_submit():
+    log("READY TO SUBMIT EXTERNAL APPLICATION – press ENTER to continue")
+    try:
+        input()
+        return True
+    except EOFError:
+        log("[EXTERNAL] Submission confirmation unavailable (stdin closed)")
+        return False
+
+def external_fill_inputs(page):
+    email = getattr(config, "APPLY_EMAIL", None)
+    phone = getattr(config, "APPLY_PHONE", None)
+    inputs = page.locator("input[type='text'], input[type='email'], input[type='tel'], textarea")
+    for i in range(inputs.count()):
+        el = inputs.nth(i)
+        context = extract_context(el)
+        try:
+            if "first name" in context:
+                el.scroll_into_view_if_needed()
+                el.fill("Andrew")
+                log("[EXTERNAL] Filled first name")
+            elif "last name" in context:
+                el.scroll_into_view_if_needed()
+                el.fill("Pennington")
+                log("[EXTERNAL] Filled last name")
+            elif "full name" in context or "your name" in context:
+                el.scroll_into_view_if_needed()
+                el.fill("Andrew Pennington")
+                log("[EXTERNAL] Filled full name")
+            elif "email" in context:
+                if email:
+                    el.scroll_into_view_if_needed()
+                    el.fill(email)
+                    log("[EXTERNAL] Filled email")
+                else:
+                    log("[WARN] APPLY_EMAIL missing in config")
+            elif "phone" in context:
+                if phone:
+                    el.scroll_into_view_if_needed()
+                    el.fill(phone)
+                    log("[EXTERNAL] Filled phone")
+                else:
+                    log("[WARN] APPLY_PHONE missing in config")
+            elif "how many years" in context:
+                el.scroll_into_view_if_needed()
+                el.fill("15")
+                log("[EXTERNAL] Filled years")
+        except Exception as exc:
+            log(f"[WARN] External input fill failed: {exc}")
+
+def external_select_dropdowns(page):
+    selects = page.locator("select")
+    for i in range(selects.count()):
+        select = selects.nth(i)
+        try:
+            options = select.locator("option")
+            chosen = None
+            for j in range(options.count()):
+                opt = options.nth(j)
+                value = opt.get_attribute("value")
+                text = opt.inner_text().strip()
+                if not value or "select" in text.lower() or "choose" in text.lower():
+                    continue
+                chosen = value
+                break
+            if chosen:
+                select.scroll_into_view_if_needed()
+                select.select_option(value=chosen)
+                log(f"[EXTERNAL] Selected dropdown option: {chosen}")
+        except Exception as exc:
+            log(f"[WARN] External dropdown select failed: {exc}")
+
+def external_handle_radios(page):
+    keywords_no = ["commute", "commuting", "distance", "travel", "relocation", "relocate", "sponsorship", "visa"]
+    radios = page.locator("input[type='radio']")
+    total = radios.count()
+    groups = {}
+    for i in range(total):
+        radio = radios.nth(i)
+        try:
+            name = radio.get_attribute("name") or f"_unnamed_{i}"
+            groups.setdefault(name, []).append(radio)
+        except Exception as exc:
+            log(f"[WARN] External radio group detection failed: {exc}")
+    for name, group in groups.items():
+        try:
+            if any(r.is_checked() for r in group):
+                continue
+            group_text = ""
+            try:
+                group_text = group[0].evaluate("e => e.closest('fieldset')?.innerText?.toLowerCase() || ''")
+            except Exception:
+                group_text = ""
+            prefer_no = any(k in group_text for k in keywords_no)
+            selected = None
+            if prefer_no:
+                for radio in group:
+                    try:
+                        label_text = radio.evaluate(
+                            """e => {
+                                const label = e.closest('label') || document.querySelector(`label[for='${e.id}']`);
+                                return label ? label.innerText.trim().toLowerCase() : '';
+                            }"""
+                        )
+                    except Exception:
+                        label_text = ""
+                    if "no" in label_text:
+                        selected = radio
+                        break
+            if selected is None:
+                for radio in group:
+                    try:
+                        if not radio.is_visible() or not radio.is_enabled():
+                            continue
+                        selected = radio
+                        break
+                    except Exception:
+                        continue
+            if selected is None:
+                continue
+            label_text = ""
+            try:
+                label_text = selected.evaluate(
+                    """e => {
+                        const label = e.closest('label') || document.querySelector(`label[for='${e.id}']`);
+                        return label ? label.innerText.trim() : '';
+                    }"""
+                )
+            except Exception:
+                label_text = ""
+            selected.scroll_into_view_if_needed()
+            selected.check(force=True)
+            log(f"[EXTERNAL] Selected radio for group {name}: {label_text or 'unlabeled'}")
+        except Exception as exc:
+            log(f"[WARN] External radio selection failed for group {name}: {exc}")
+
+def external_handle_demographics(page):
+    keywords = ["gender", "ethnicity", "race", "veteran", "disability"]
+    try:
+        body = page.inner_text("body").lower()
+    except Exception as exc:
+        log(f"[WARN] External demographics check failed: {exc}")
+        body = ""
+    if not any(k in body for k in keywords):
+        return
+    selections = [
+        ("gender", "Male"),
+        ("ethnicity", "Not Hispanic or Latino"),
+        ("race", "White"),
+        ("veteran", "No"),
+        ("disability", "No, I do not have a disability and have not had one in the past"),
+    ]
+    matched = False
+    for key, val in selections:
+        if key in body:
+            loc = page.locator(f"label:has-text('{val}')")
+            if loc.count():
+                matched = True
+                try:
+                    loc.first.scroll_into_view_if_needed()
+                    loc.first.click(force=True)
+                    log(f"[EXTERNAL] Demographic selected {val}")
+                except Exception as exc:
+                    log(f"[WARN] External demographic selection failed for {val}: {exc}")
+    if not matched:
+        log("[EXTERNAL] demographic_skipped")
+
+def external_click_actions(page):
+    for label in EXTERNAL_ACTION_LABELS:
+        loc = page.locator(f"button:has-text('{label}')")
+        if locator_has_visible(loc):
+            try:
+                loc.first.scroll_into_view_if_needed()
+                loc.first.click(timeout=15000)
+                log(f"[EXTERNAL] Clicked {label}")
+                return True
+            except Exception as exc:
+                log(f"[WARN] External click failed on {label}: {exc}")
+                try:
+                    loc.first.scroll_into_view_if_needed()
+                    loc.first.click(timeout=15000, force=True)
+                    log(f"[EXTERNAL] Retry click success: {label}")
+                    return True
+                except Exception as retry_exc:
+                    log(f"[WARN] External retry click failed on {label}: {retry_exc}")
+    return False
+
+def external_handle_submit(page):
+    for label in EXTERNAL_FINAL_SUBMIT_LABELS:
+        loc = page.locator(f"button:has-text('{label}')")
+        if locator_has_visible(loc):
+            if not external_confirm_submit():
+                return "confirmation_unavailable"
+            try:
+                loc.first.scroll_into_view_if_needed()
+                loc.first.click(timeout=20000)
+                log(f"[EXTERNAL] Clicked final submit: {label}")
+                return "submitted"
+            except Exception as exc:
+                log(f"[WARN] External submit click failed: {exc}")
+                try:
+                    loc.first.scroll_into_view_if_needed()
+                    loc.first.click(timeout=20000, force=True)
+                    log(f"[EXTERNAL] Retry final submit: {label}")
+                    return "submitted"
+                except Exception as retry_exc:
+                    log(f"[WARN] External submit retry failed: {retry_exc}")
+                    return "navigation_blocked"
+    return None
+
+def external_detect_required_errors(page):
+    try:
+        body = page.inner_text("body").lower()
+    except Exception as exc:
+        log(f"[WARN] External required check failed: {exc}")
+        return False
+    return "required" in body or "please fill" in body or "missing" in body
+
+def external_apply_handler(page, context, external_info):
+    active_page = external_info["page"]
+    initial_url = active_page.url
+    if external_info.get("button"):
+        label = external_info["button"]
+        log(f"[EXTERNAL] Triggered by button: {label}")
+        button = active_page.locator(f"button:has-text('{label}')")
+        try:
+            button.first.scroll_into_view_if_needed()
+            button.first.click(timeout=15000)
+        except Exception as exc:
+            log(f"[WARN] External apply button click failed: {exc}")
+            try:
+                button.first.scroll_into_view_if_needed()
+                button.first.click(timeout=15000, force=True)
+            except Exception as retry_exc:
+                log(f"[WARN] External apply button retry failed: {retry_exc}")
+        try:
+            new_page = context.wait_for_event("page", timeout=15000)
+            active_page = new_page
+        except Exception as exc:
+            log(f"[WARN] No new tab detected after external apply button: {exc}")
+    final_url = active_page.url
+    ats = detect_ats(final_url, active_page)
+    log(f"[EXTERNAL] Detected ATS: {ats} URL: {final_url}")
+    mark_external_site(final_url, ats, external_info.get("reason", "external_detected"))
+
+    for step in range(30):
+        log(f"[EXTERNAL STEP] {step+1} URL: {active_page.url} ATS: {ats}")
+        slow_wait(3)
+        detect_captcha(active_page, reason=f"external_step_{step+1}", is_external=True)
+        external_fill_inputs(active_page)
+        external_select_dropdowns(active_page)
+        external_handle_radios(active_page)
+        external_handle_demographics(active_page)
+
+        submit_result = external_handle_submit(active_page)
+        if submit_result == "confirmation_unavailable":
+            external_fail("navigation_blocked", "confirmation_unavailable", active_page, final_url, ats)
+        if submit_result == "navigation_blocked":
+            external_fail("navigation_blocked", "submit_blocked", active_page, final_url, ats)
+        if submit_result == "submitted":
+            slow_wait(4)
+            try:
+                body = active_page.inner_text("body").lower()
+            except Exception as exc:
+                log(f"[WARN] External success check failed: {exc}")
+                body = ""
+            if any(t in body for t in SUCCESS_TEXTS):
+                db_update(JOB_URL, "applied", format_external_reason(active_page.url, ats, "external_applied"), is_external=True)
+                log("[EXTERNAL] Application submitted")
+                sys.exit(0)
+            db_update(JOB_URL, "external_submitted", format_external_reason(active_page.url, ats, "submitted_no_confirmation"), is_external=True)
+            log("[EXTERNAL] Submitted without confirmation text")
+            sys.exit(0)
+
+        if external_click_actions(active_page):
+            continue
+
+        if external_detect_required_errors(active_page):
+            external_fail("missing_required_fields", "required_fields", active_page, final_url, ats)
+
+        log("[EXTERNAL] No actionable button found")
+        slow_wait(5)
+
+    external_fail("unsupported_external_flow", "max_steps", active_page, final_url, ats)
+
 def update_progress_marker(page):
     url = page.url
     value = None
@@ -486,7 +880,10 @@ try:
 
         detect_invalid(page, response)
         detect_captcha(page, reason="landing")
-        detect_external(page)
+        external_info = detect_external_context(page, ctx)
+        if external_info:
+            external_apply_handler(page, ctx, external_info)
+            sys.exit(0)
 
         if not find_apply_button(page):
             log("[FAIL] No Apply CTA found")
@@ -499,7 +896,10 @@ try:
 
             detect_invalid(page)
             detect_captcha(page, reason=f"step_{step+1}")
-            detect_external(page)
+            external_info = detect_external_context(page, ctx)
+            if external_info:
+                external_apply_handler(page, ctx, external_info)
+                sys.exit(0)
             check_for_stall(page)
 
             body = page.inner_text("body").lower()

@@ -8,12 +8,16 @@ PYTHON = sys.executable
 RETRYABLE_STATUSES = (
     "applied",
     "external",
+    "external_submitted",
     "blocked",
     "failed",
     "invalid",
     "no_apply",
     "permanent_failed",
     "captcha_pending",
+    "unsupported_external_flow",
+    "missing_required_fields",
+    "navigation_blocked",
 )
 
 def fetch_jobs(limit):
@@ -26,7 +30,7 @@ def fetch_jobs(limit):
                     SELECT job_url
                     FROM jobs
                     WHERE applied = 0
-                      AND (status IS NULL OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?))
+                      AND (status IS NULL OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
                     LIMIT ?
                     """,
                     (*RETRYABLE_STATUSES, limit),
