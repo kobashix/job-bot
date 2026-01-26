@@ -152,7 +152,7 @@ def prompt_captcha_and_retry():
         except Exception as exc:
             log(f"[WARN] Retry action failed after captcha: {exc}")
 
-def detect_captcha(page, reason="captcha_detected", is_external=False):
+def detect_captcha(page, reason="captcha_detected", is_external=False, allow_retry=True):
     body = ""
     title = ""
     try:
@@ -166,14 +166,28 @@ def detect_captcha(page, reason="captcha_detected", is_external=False):
         strong_text = any(t in body for t in ["i'm not a robot", "verify you are human", "security check"])
         if footer_only and not strong_text:
             log("[CAPTCHA] Footer recaptcha notice detected; no challenge visible")
+            return False
         else:
+            if allow_retry:
+                log("[CAPTCHA] Challenge text detected; retrying action before prompt")
+                if click_any(page, ["Continue", "Review", "Submit", "Submit your application"], timeout=8000):
+                    slow_wait(2)
+                    return detect_captcha(page, reason=reason, is_external=is_external, allow_retry=False)
             mark_captcha_pending(f"{reason}:visible_text")
             prompt_captcha_and_retry()
             return True
     for t in BLOCK_TEXTS:
         if t in ["captcha"]:
             if t in body or t in title:
+                if footer_only and not page.locator(CAPTCHA_CHALLENGE_LOCATOR).count():
+                    log("[CAPTCHA] Footer recaptcha notice detected; no challenge visible")
+                    return False
                 if locator_has_visible(text_locator) or page.locator(CAPTCHA_CHALLENGE_LOCATOR).count():
+                    if allow_retry:
+                        log("[CAPTCHA] Challenge indicators detected; retrying action before prompt")
+                        if click_any(page, ["Continue", "Review", "Submit", "Submit your application"], timeout=8000):
+                            slow_wait(2)
+                            return detect_captcha(page, reason=reason, is_external=is_external, allow_retry=False)
                     mark_captcha_pending(f"{reason}:{t}", is_external=is_external)
                     prompt_captcha_and_retry()
                     return True
@@ -184,11 +198,21 @@ def detect_captcha(page, reason="captcha_detected", is_external=False):
                 return True
     captcha_frames = page.locator(", ".join(CAPTCHA_IFRAME_SELECTORS))
     if captcha_frames.count() and locator_has_visible(captcha_frames):
+        if allow_retry:
+            log("[CAPTCHA] Captcha widget visible; retrying action before prompt")
+            if click_any(page, ["Continue", "Review", "Submit", "Submit your application"], timeout=8000):
+                slow_wait(2)
+                return detect_captcha(page, reason=reason, is_external=is_external, allow_retry=False)
         mark_captcha_pending(f"{reason}:iframe_visible", is_external=is_external)
         prompt_captcha_and_retry()
         return True
     challenge_frames = page.locator(CAPTCHA_CHALLENGE_LOCATOR)
     if challenge_frames.count():
+        if allow_retry:
+            log("[CAPTCHA] Challenge frame detected; retrying action before prompt")
+            if click_any(page, ["Continue", "Review", "Submit", "Submit your application"], timeout=8000):
+                slow_wait(2)
+                return detect_captcha(page, reason=reason, is_external=is_external, allow_retry=False)
         mark_captcha_pending(f"{reason}:challenge_frame", is_external=is_external)
         prompt_captcha_and_retry()
         return True
@@ -303,7 +327,7 @@ def click_any(page, labels, timeout=5000):
                     return True
                 except Exception as retry_exc:
                     log(f"[WARN] Retry click failed on {label}: {retry_exc}")
-                    if detect_captcha(page, reason="blocked_click"):
+                    if detect_captcha(page, reason="blocked_click", allow_retry=False):
                         return True
     return False
 
