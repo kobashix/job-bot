@@ -31,10 +31,6 @@ def fetch_jobs(limit):
                     SELECT job_url
                     FROM jobs
                     WHERE applied = 0
-                      AND (
-                        lower(COALESCE(location, '')) LIKE '%remote%'
-                        OR lower(COALESCE(title, '')) LIKE '%remote%'
-                      )
                       AND (status IS NULL OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
                     LIMIT ?
                     """,
