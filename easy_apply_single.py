@@ -270,6 +270,37 @@ def detect_invalid(page, response=None):
             db_update(JOB_URL, "invalid", f"invalid_text:{text}")
             sys.exit(12)
 
+def detect_invalid(page, response=None):
+    status = None
+    if response is not None:
+        try:
+            status = response.status
+        except Exception:
+            status = None
+    if status and status >= 400:
+        log(f"[INVALID] HTTP status {status}")
+        db_update(JOB_URL, "invalid", f"http_status_{status}")
+        sys.exit(12)
+    try:
+        body = page.inner_text("body").lower()
+        title = page.title().lower()
+    except Exception as exc:
+        log(f"[WARN] Failed reading page text: {exc}")
+        return
+    invalid_texts = [
+        "job expired",
+        "job is no longer available",
+        "job has expired",
+        "this job is no longer available",
+        "404",
+        "page not found",
+    ]
+    for text in invalid_texts:
+        if text in body or text in title:
+            log(f"[INVALID] {text}")
+            db_update(JOB_URL, "invalid", f"invalid_text:{text}")
+            sys.exit(12)
+
 def click_any(page, labels, timeout=5000):
     for label in labels:
         loc = page.locator(f"button:has-text('{label}')")
