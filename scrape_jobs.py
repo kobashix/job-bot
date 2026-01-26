@@ -36,9 +36,14 @@ def save_job(conn, job):
                 status,
                 applied,
                 attempts,
+                last_attempt_at,
+                last_error,
                 created_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', 0, 0, datetime('now'), datetime('now'))
+                updated_at,
+                score,
+                decision,
+                notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'new', 0, 0, NULL, NULL, datetime('now'), datetime('now'), 0, 'apply', NULL)
         """, (
             job["job_id"],
             job["job_url"],
@@ -91,13 +96,56 @@ def extract_jobs(page):
 
         job_url = normalize_indeed_url(href)
         title = card.inner_text().split("\n")[0].strip()
+        location = "Unknown"
+        remote_hint = "remote" in title.lower()
+        location_locators = [
+            "span[data-testid='text-location']",
+            ".companyLocation",
+            "div[data-testid='text-location']",
+        ]
+        for selector in location_locators:
+            loc = card.locator(selector)
+            if loc.count():
+                try:
+                    location = loc.first.inner_text().strip()
+                except Exception:
+                    location = "Unknown"
+                break
+        if location == "Unknown":
+            try:
+                info_url = f"https://www.indeed.com/viewjob?jk={jk}"
+                info_page = page.context.new_page()
+                info_page.goto(info_url, timeout=30000)
+                try:
+                    detail_title = info_page.title().lower()
+                    if "remote" in detail_title:
+                        remote_hint = True
+                except Exception:
+                    pass
+                info_locators = [
+                    "[data-testid='jobLocationText']",
+                    ".jobsearch-JobInfoHeader-subtitle",
+                    ".jobsearch-JobInfoHeader-subtitle div",
+                ]
+                for selector in info_locators:
+                    loc = info_page.locator(selector)
+                    if loc.count():
+                        location = loc.first.inner_text().strip()
+                        break
+                info_page.close()
+            except Exception as exc:
+                print(f"⚠️ Unable to fetch detail location for {jk}: {exc}")
+        remote_label = "remote" in location.lower()
+        if not remote_label and not remote_hint:
+            print(f"⏭️ Skipping non-remote job: {title} ({location})")
+            continue
 
         jobs.append({
             "job_id": jk,
             "job_url": job_url,
             "title": title,
             "company": "Unknown",
-            "location": "Unknown",
+            "location": location,
             "is_external": 0
         })
 
