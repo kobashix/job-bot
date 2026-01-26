@@ -112,6 +112,8 @@ def main(limit=10):
     log("\nBatch complete")
     log(f"Successes: {success}")
     log(f"Failures: {fail}")
+    if success == 0 and fail == 0:
+        log("[ERROR] No jobs processed. Check filters, job status, or database contents.")
 
 if __name__ == "__main__":
     limit = 10
