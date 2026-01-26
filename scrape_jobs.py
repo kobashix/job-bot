@@ -105,8 +105,29 @@ def extract_jobs(page):
         for selector in location_locators:
             loc = card.locator(selector)
             if loc.count():
-                location = loc.first.inner_text().strip()
+                try:
+                    location = loc.first.inner_text().strip()
+                except Exception:
+                    location = "Unknown"
                 break
+        if location == "Unknown":
+            try:
+                info_url = f"https://www.indeed.com/viewjob?jk={jk}"
+                info_page = page.context.new_page()
+                info_page.goto(info_url, timeout=30000)
+                info_locators = [
+                    "[data-testid='jobLocationText']",
+                    ".jobsearch-JobInfoHeader-subtitle",
+                    ".jobsearch-JobInfoHeader-subtitle div",
+                ]
+                for selector in info_locators:
+                    loc = info_page.locator(selector)
+                    if loc.count():
+                        location = loc.first.inner_text().strip()
+                        break
+                info_page.close()
+            except Exception as exc:
+                print(f"⚠️ Unable to fetch detail location for {jk}: {exc}")
         if "remote" not in location.lower():
             print(f"⏭️ Skipping non-remote job: {title} ({location})")
             continue
