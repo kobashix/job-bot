@@ -161,10 +161,15 @@ def detect_captcha(page, reason="captcha_detected", is_external=False):
     except Exception as exc:
         log(f"[WARN] Failed reading page text: {exc}")
     text_locator = page.locator(CAPTCHA_TEXT_LOCATOR)
+    footer_only = "protected by recaptcha" in body and "google privacy policy" in body
     if locator_has_visible(text_locator):
-        mark_captcha_pending(f"{reason}:visible_text")
-        prompt_captcha_and_retry()
-        return True
+        strong_text = any(t in body for t in ["i'm not a robot", "verify you are human", "security check"])
+        if footer_only and not strong_text:
+            log("[CAPTCHA] Footer recaptcha notice detected; no challenge visible")
+        else:
+            mark_captcha_pending(f"{reason}:visible_text")
+            prompt_captcha_and_retry()
+            return True
     for t in BLOCK_TEXTS:
         if t in ["captcha"]:
             if t in body or t in title:
