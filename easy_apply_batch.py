@@ -15,6 +15,7 @@ RETRYABLE_STATUSES = (
     "no_apply",
     "permanent_failed",
     "captcha_pending",
+    "non_remote",
     "unsupported_external_flow",
     "missing_required_fields",
     "navigation_blocked",
@@ -30,7 +31,8 @@ def fetch_jobs(limit):
                     SELECT job_url
                     FROM jobs
                     WHERE applied = 0
-                      AND (status IS NULL OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
+                      AND lower(COALESCE(location, '')) LIKE '%remote%'
+                      AND (status IS NULL OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
                     LIMIT ?
                     """,
                     (*RETRYABLE_STATUSES, limit),

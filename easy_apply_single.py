@@ -370,6 +370,34 @@ def handle_additional_verification(page, timeout_sec=30):
             sys.exit(21)
     return False
 
+def detect_non_remote_job(page):
+    location_candidates = []
+    selectors = [
+        "[data-testid*='location']",
+        ".jobsearch-JobInfoHeader-subtitle",
+        ".jobsearch-JobInfoHeader-subtitle div",
+        "span:has-text('Location')",
+    ]
+    for selector in selectors:
+        loc = page.locator(selector)
+        if loc.count():
+            try:
+                text = loc.first.inner_text().strip()
+            except Exception as exc:
+                log(f"[WARN] Location read failed: {exc}")
+                continue
+            if text:
+                location_candidates.append(text)
+    for text in location_candidates:
+        lowered = text.lower()
+        if "remote" in lowered:
+            return False
+    if location_candidates:
+        reason = f"non_remote:{location_candidates[0][:200]}"
+        log(f"[NON_REMOTE] Detected non-remote job location: {location_candidates[0]}")
+        db_update(JOB_URL, "non_remote", reason)
+        sys.exit(14)
+    return False
 def click_any(page, labels, timeout=5000):
     for label in labels:
         loc = page.locator(f"button:has-text('{label}')")
@@ -986,6 +1014,7 @@ try:
         detect_invalid(page, response)
         detect_not_found_and_delete(page)
         handle_additional_verification(page)
+        detect_non_remote_job(page)
         detect_captcha(page, reason="landing")
         external_info = detect_external_context(page, ctx)
         if external_info:
@@ -1004,6 +1033,7 @@ try:
             detect_invalid(page)
             detect_not_found_and_delete(page)
             handle_additional_verification(page)
+            detect_non_remote_job(page)
             detect_captcha(page, reason=f"step_{step+1}")
             external_info = detect_external_context(page, ctx)
             if external_info:
