@@ -97,6 +97,7 @@ def extract_jobs(page):
         job_url = normalize_indeed_url(href)
         title = card.inner_text().split("\n")[0].strip()
         location = "Unknown"
+        remote_hint = "remote" in title.lower()
         location_locators = [
             "span[data-testid='text-location']",
             ".companyLocation",
@@ -115,6 +116,12 @@ def extract_jobs(page):
                 info_url = f"https://www.indeed.com/viewjob?jk={jk}"
                 info_page = page.context.new_page()
                 info_page.goto(info_url, timeout=30000)
+                try:
+                    detail_title = info_page.title().lower()
+                    if "remote" in detail_title:
+                        remote_hint = True
+                except Exception:
+                    pass
                 info_locators = [
                     "[data-testid='jobLocationText']",
                     ".jobsearch-JobInfoHeader-subtitle",
@@ -128,7 +135,8 @@ def extract_jobs(page):
                 info_page.close()
             except Exception as exc:
                 print(f"⚠️ Unable to fetch detail location for {jk}: {exc}")
-        if "remote" not in location.lower():
+        remote_label = "remote" in location.lower()
+        if not remote_label and not remote_hint:
             print(f"⏭️ Skipping non-remote job: {title} ({location})")
             continue
 
