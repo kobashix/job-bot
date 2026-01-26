@@ -502,10 +502,14 @@ def handle_resume_screen(page):
                 except Exception as retry_exc:
                     log(f"[WARN] Resume card retry failed: {retry_exc}")
         slow_wait(2)
-        try:
-            page.wait_for_selector("button:has-text('Continue')", timeout=20000)
-        except Exception as exc:
-            log(f"[WARN] Continue button not visible yet: {exc}")
+        continue_btn = page.locator("button:has-text('Continue'), [role='button']:has-text('Continue')")
+        if continue_btn.count():
+            try:
+                continue_btn.first.scroll_into_view_if_needed()
+            except Exception as exc:
+                log(f"[WARN] Continue scroll failed: {exc}")
+        else:
+            log("[WARN] Continue button not found yet; retrying click")
         click_any(page, ["Continue"], timeout=20000)
 
 def handle_radios(page):
