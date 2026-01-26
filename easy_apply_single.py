@@ -8,7 +8,20 @@ from pathlib import Path
 from urllib.parse import urlparse
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-JOB_URL = sys.argv[1]
+def parse_args(argv):
+    train_mode = False
+    url = None
+    for arg in argv[1:]:
+        if arg == "--train":
+            train_mode = True
+        elif not arg.startswith("--") and url is None:
+            url = arg
+    return url, train_mode
+
+JOB_URL, TRAIN_MODE = parse_args(sys.argv)
+if not JOB_URL:
+    print("[FAIL] Missing job URL argument", flush=True)
+    sys.exit(2)
 JOB_HOST = urlparse(JOB_URL).netloc.lower()
 
 DB_PATH = "jobs.db"
@@ -134,6 +147,27 @@ def load_answers():
     return json.loads(ANSWERS_FILE.read_text())
 
 ANSWERS = load_answers()
+
+def save_answers():
+    ANSWERS_FILE.write_text(json.dumps(ANSWERS, indent=2, sort_keys=True))
+
+def normalize_answer_key(text):
+    cleaned = "".join(ch if ch.isalnum() or ch.isspace() else " " for ch in text.lower())
+    return "_".join(cleaned.split())[:80]
+
+def record_answer(label, value):
+    if not TRAIN_MODE or not label or not value:
+        return
+    key = normalize_answer_key(label)
+    if not key:
+        return
+    entry = ANSWERS.get(key, {"default": value, "aliases": []})
+    entry["default"] = value
+    aliases = set(entry.get("aliases", []))
+    aliases.add(label)
+    entry["aliases"] = sorted(aliases)
+    ANSWERS[key] = entry
+    save_answers()
 
 def slow_wait(sec=2):
     time.sleep(sec)
@@ -403,6 +437,9 @@ def click_any(page, labels, timeout=5000):
         loc = page.locator(f"button:has-text('{label}')")
         if loc.count():
             try:
+                if TRAIN_MODE and "submit" in label.lower():
+                    log(f"[TRAIN] Skipping submit click: {label}")
+                    return False
                 loc.first.scroll_into_view_if_needed()
                 LAST_ACTION["label"] = label
                 LAST_ACTION["fn"] = lambda l=loc.first, t=timeout: l.click(timeout=t, force=True)
@@ -475,6 +512,11 @@ def handle_radios(page):
             if any(r.is_checked() for r in group):
                 continue
             selected = None
+            group_text = ""
+            try:
+                group_text = group[0].evaluate("e => e.closest('fieldset')?.innerText?.trim() || ''")
+            except Exception:
+                group_text = ""
             for radio in group:
                 try:
                     if not radio.is_visible() or not radio.is_enabled():
@@ -498,6 +540,8 @@ def handle_radios(page):
             selected.scroll_into_view_if_needed()
             selected.check(force=True)
             log(f"[RADIO] Selected first option for group {name}: {label_text or 'unlabeled'}")
+            if group_text:
+                record_answer(group_text, label_text or "first_option")
         except Exception as exc:
             log(f"[WARN] Radio default failed for group {name}: {exc}")
 
@@ -524,6 +568,7 @@ def handle_special_radios(page):
                     loc.first.scroll_into_view_if_needed()
                     loc.first.click(force=True)
                     log(f"[EEO] Selected {val}")
+                    record_answer(key, val)
                 except Exception as exc:
                     log(f"[WARN] EEO selection failed for {val}: {exc}")
 
@@ -603,6 +648,7 @@ def handle_inputs(page):
                 el.scroll_into_view_if_needed()
                 el.fill("Andrew Pennington")
                 log("[INPUT] Filled name")
+                record_answer("full name", "Andrew Pennington")
             elif "what industries have you supported" in context:
                 el.scroll_into_view_if_needed()
                 el.fill(
@@ -610,26 +656,32 @@ def handle_inputs(page):
                     "tourism, construction, and general small business areas."
                 )
                 log("[INPUT] Filled industries supported")
+                record_answer("what industries have you supported", el.input_value())
             elif "how large was the organization you supported" in context:
                 el.scroll_into_view_if_needed()
                 el.fill("I currently support a national organization within 100s of locations and thousands of employees.")
                 log("[INPUT] Filled organization size")
+                record_answer("how large was the organization you supported", el.input_value())
             elif "size of team managed" in context:
                 el.scroll_into_view_if_needed()
                 el.fill("20+ team members managed.")
                 log("[INPUT] Filled team size")
+                record_answer("size of team managed", el.input_value())
             elif "do you have" in context and "degree" in context:
                 el.scroll_into_view_if_needed()
                 el.fill("I have an MBA and MAcc, also a CPA.")
                 log("[INPUT] Filled degree response")
+                record_answer("do you have a degree", el.input_value())
             elif "today" in context or "date" in context:
                 el.scroll_into_view_if_needed()
                 el.fill(datetime.now().strftime("%m/%d/%Y"))
                 log("[INPUT] Filled date")
+                record_answer("today date", el.input_value())
             elif "how many years" in context or "years of" in context:
                 el.scroll_into_view_if_needed()
                 el.fill("15")
                 log("[INPUT] Filled years")
+                record_answer("how many years", el.input_value())
         except Exception as exc:
             log(f"[WARN] Input fill failed: {exc}")
 
@@ -647,6 +699,7 @@ def handle_relevant_experience(page):
             if input_loc.count():
                 input_loc.first.check(force=True)
             log(f"[EXPERIENCE] Selected {option_text}")
+            record_answer("highlight a job that shows relevant experience", option_text)
     except Exception as exc:
         log(f"[WARN] Experience selection failed: {exc}")
 
@@ -671,6 +724,9 @@ def external_fail(status, reason, page, final_url, ats):
 def external_confirm_submit():
     log("READY TO SUBMIT EXTERNAL APPLICATION – press ENTER to continue")
     try:
+        if TRAIN_MODE:
+            log("[TRAIN] Skipping external submit confirmation")
+            return False
         input()
         return True
     except EOFError:
