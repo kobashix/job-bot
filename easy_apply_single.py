@@ -558,6 +558,8 @@ def handle_special_radios(page):
         ("race", "White"),
         ("veteran", "No"),
         ("disability", "No, I do not have a disability and have not had one in the past"),
+        ("work authorization", "Yes"),
+        ("authorized to work", "Yes"),
     ]
     try:
         body = page.inner_text("body").lower()
@@ -676,6 +678,11 @@ def handle_inputs(page):
                 el.fill("I have an MBA and MAcc, also a CPA.")
                 log("[INPUT] Filled degree response")
                 record_answer("do you have a degree", el.input_value())
+            elif "compensation" in context:
+                el.scroll_into_view_if_needed()
+                el.fill("100,000-150,000")
+                log("[INPUT] Filled compensation range")
+                record_answer("compensation", el.input_value())
             elif "today" in context or "date" in context:
                 el.scroll_into_view_if_needed()
                 el.fill(datetime.now().strftime("%m/%d/%Y"))
@@ -997,9 +1004,19 @@ def external_apply_handler(page, context, external_info):
             if any(t in body for t in SUCCESS_TEXTS):
                 db_update(JOB_URL, "applied", format_external_reason(active_page.url, ats, "external_applied"), is_external=True)
                 log("[EXTERNAL] Application submitted")
+                try:
+                    active_page.close()
+                    log("[CLOSE] Closed successful external application tab")
+                except Exception as exc:
+                    log(f"[WARN] Failed to close external tab: {exc}")
                 sys.exit(0)
             db_update(JOB_URL, "external_submitted", format_external_reason(active_page.url, ats, "submitted_no_confirmation"), is_external=True)
             log("[EXTERNAL] Submitted without confirmation text")
+            try:
+                active_page.close()
+                log("[CLOSE] Closed external tab after submission")
+            except Exception as exc:
+                log(f"[WARN] Failed to close external tab: {exc}")
             sys.exit(0)
 
         if external_click_actions(active_page):
@@ -1105,6 +1122,11 @@ try:
             if any(t in body for t in SUCCESS_TEXTS):
                 log("[SUCCESS] Application submitted")
                 db_update(JOB_URL, "applied")
+                try:
+                    page.close()
+                    log("[CLOSE] Closed successful application tab")
+                except Exception as exc:
+                    log(f"[WARN] Failed to close tab: {exc}")
                 sys.exit(0)
 
             handle_resume_screen(page)
