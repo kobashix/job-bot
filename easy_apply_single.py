@@ -481,18 +481,26 @@ def handle_resume_screen(page):
             page.wait_for_selector("text=Use your Indeed Resume, text=Upload a resume", timeout=20000)
         except Exception as exc:
             log(f"[WARN] Resume options not visible yet: {exc}")
-        log("[RESUME] Selecting Indeed resume")
+        selected = False
         card = page.locator("text=Use your Indeed Resume").first
         try:
-            card.scroll_into_view_if_needed()
-            card.click(force=True)
+            selected = card.locator("[aria-checked='true'], [data-checked='true'], [data-selected='true']").count() > 0
         except Exception as exc:
-            log(f"[WARN] Resume card click failed: {exc}")
+            log(f"[WARN] Resume selection check failed: {exc}")
+        if selected:
+            log("[RESUME] Indeed resume already selected; skipping click")
+        else:
+            log("[RESUME] Selecting Indeed resume")
             try:
                 card.scroll_into_view_if_needed()
                 card.click(force=True)
-            except Exception as retry_exc:
-                log(f"[WARN] Resume card retry failed: {retry_exc}")
+            except Exception as exc:
+                log(f"[WARN] Resume card click failed: {exc}")
+                try:
+                    card.scroll_into_view_if_needed()
+                    card.click(force=True)
+                except Exception as retry_exc:
+                    log(f"[WARN] Resume card retry failed: {retry_exc}")
         slow_wait(2)
         try:
             page.wait_for_selector("button:has-text('Continue')", timeout=20000)
