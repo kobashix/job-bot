@@ -364,6 +364,10 @@ def detect_not_found_and_delete(page):
     except Exception as exc:
         log(f"[WARN] Failed reading page text: {exc}")
         return False
+    if "this job has expired on indeed" in body or "this job has expired on indeed" in title:
+        log("[INVALID] Job expired banner detected; deleting job")
+        db_delete(JOB_URL)
+        sys.exit(13)
     if "not found" in body or "not found" in title:
         log("[INVALID] Not Found page detected; deleting job")
         db_delete(JOB_URL)
