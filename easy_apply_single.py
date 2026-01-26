@@ -997,9 +997,19 @@ def external_apply_handler(page, context, external_info):
             if any(t in body for t in SUCCESS_TEXTS):
                 db_update(JOB_URL, "applied", format_external_reason(active_page.url, ats, "external_applied"), is_external=True)
                 log("[EXTERNAL] Application submitted")
+                try:
+                    active_page.close()
+                    log("[CLOSE] Closed successful external application tab")
+                except Exception as exc:
+                    log(f"[WARN] Failed to close external tab: {exc}")
                 sys.exit(0)
             db_update(JOB_URL, "external_submitted", format_external_reason(active_page.url, ats, "submitted_no_confirmation"), is_external=True)
             log("[EXTERNAL] Submitted without confirmation text")
+            try:
+                active_page.close()
+                log("[CLOSE] Closed external tab after submission")
+            except Exception as exc:
+                log(f"[WARN] Failed to close external tab: {exc}")
             sys.exit(0)
 
         if external_click_actions(active_page):
@@ -1105,6 +1115,11 @@ try:
             if any(t in body for t in SUCCESS_TEXTS):
                 log("[SUCCESS] Application submitted")
                 db_update(JOB_URL, "applied")
+                try:
+                    page.close()
+                    log("[CLOSE] Closed successful application tab")
+                except Exception as exc:
+                    log(f"[WARN] Failed to close tab: {exc}")
                 sys.exit(0)
 
             handle_resume_screen(page)
