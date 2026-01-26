@@ -114,5 +114,12 @@ def main(limit=10):
     log(f"Failures: {fail}")
 
 if __name__ == "__main__":
-    limit = int(sys.argv[sys.argv.index("--limit")+1]) if "--limit" in sys.argv else 10
+    limit = 10
+    if "--limit" in sys.argv:
+        limit = int(sys.argv[sys.argv.index("--limit") + 1])
+    else:
+        for arg in sys.argv[1:]:
+            if arg.startswith("--limit="):
+                limit = int(arg.split("=", 1)[1])
+                break
     main(limit)
