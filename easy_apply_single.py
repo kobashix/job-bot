@@ -105,6 +105,29 @@ def db_update(job_url, status, reason=None, is_external=None):
                 continue
             raise
 
+def db_delete(job_url):
+    attempts = 0
+    while True:
+        try:
+            with sqlite3.connect(DB_PATH, timeout=30) as conn:
+                conn.execute(
+                    """
+                    DELETE FROM jobs
+                    WHERE job_url = ?
+                    """,
+                    (job_url,),
+                )
+                conn.commit()
+            log(f"[DB] Deleted job: {job_url}")
+            return
+        except sqlite3.OperationalError as exc:
+            attempts += 1
+            log(f"[DB] Delete failed ({attempts}): {exc}")
+            if "locked" in str(exc).lower() and attempts < 6:
+                time.sleep(2 + attempts)
+                continue
+            raise
+
 def load_answers():
     if not ANSWERS_FILE.exists():
         ANSWERS_FILE.write_text("{}")
@@ -292,12 +315,60 @@ def detect_invalid(page, response=None):
         "this job is no longer available",
         "404",
         "page not found",
+        "not found",
     ]
     for text in invalid_texts:
         if text in body or text in title:
             log(f"[INVALID] {text}")
             db_update(JOB_URL, "invalid", f"invalid_text:{text}")
             sys.exit(12)
+
+def detect_not_found_and_delete(page):
+    try:
+        body = page.inner_text("body").lower()
+        title = page.title().lower()
+    except Exception as exc:
+        log(f"[WARN] Failed reading page text: {exc}")
+        return False
+    if "not found" in body or "not found" in title:
+        log("[INVALID] Not Found page detected; deleting job")
+        db_delete(JOB_URL)
+        sys.exit(13)
+    return False
+
+def handle_additional_verification(page, timeout_sec=30):
+    try:
+        body = page.inner_text("body").lower()
+        title = page.title().lower()
+    except Exception as exc:
+        log(f"[WARN] Failed reading page text: {exc}")
+        return False
+    if "additional verification needed" in body or "additional verification needed" in title:
+        log("[CAPTCHA] Additional verification needed; solve captcha then press ENTER")
+        mark_captcha_pending("additional_verification")
+        try:
+            import threading
+            user_input = {"done": False}
+            def wait_for_input():
+                try:
+                    input()
+                    user_input["done"] = True
+                except EOFError:
+                    log("[CAPTCHA] No stdin available to continue")
+            thread = threading.Thread(target=wait_for_input, daemon=True)
+            thread.start()
+            thread.join(timeout=timeout_sec)
+            if not user_input["done"]:
+                log("[CAPTCHA] Verification timeout; moving to next job")
+                db_update(JOB_URL, "captcha_pending", "verification_timeout")
+                sys.exit(21)
+            log("[CAPTCHA] Verification acknowledged; continuing")
+            return True
+        except Exception as exc:
+            log(f"[WARN] Verification prompt failed: {exc}")
+            db_update(JOB_URL, "captcha_pending", "verification_prompt_failed")
+            sys.exit(21)
+    return False
 
 def click_any(page, labels, timeout=5000):
     for label in labels:
@@ -504,6 +575,25 @@ def handle_inputs(page):
                 el.scroll_into_view_if_needed()
                 el.fill("Andrew Pennington")
                 log("[INPUT] Filled name")
+            elif "what industries have you supported" in context:
+                el.scroll_into_view_if_needed()
+                el.fill(
+                    "I have previous experience in healthcare, education, state and local government, "
+                    "tourism, construction, and general small business areas."
+                )
+                log("[INPUT] Filled industries supported")
+            elif "how large was the organization you supported" in context:
+                el.scroll_into_view_if_needed()
+                el.fill("I currently support a national organization within 100s of locations and thousands of employees.")
+                log("[INPUT] Filled organization size")
+            elif "size of team managed" in context:
+                el.scroll_into_view_if_needed()
+                el.fill("20+ team members managed.")
+                log("[INPUT] Filled team size")
+            elif "do you have" in context and "degree" in context:
+                el.scroll_into_view_if_needed()
+                el.fill("I have an MBA and MAcc, also a CPA.")
+                log("[INPUT] Filled degree response")
             elif "today" in context or "date" in context:
                 el.scroll_into_view_if_needed()
                 el.fill(datetime.now().strftime("%m/%d/%Y"))
@@ -514,6 +604,23 @@ def handle_inputs(page):
                 log("[INPUT] Filled years")
         except Exception as exc:
             log(f"[WARN] Input fill failed: {exc}")
+
+def handle_relevant_experience(page):
+    option_text = "Controller National Park College"
+    try:
+        if page.locator(f"text={option_text}").count():
+            loc = page.locator(f"text={option_text}").first
+            loc.scroll_into_view_if_needed()
+            try:
+                loc.click(force=True)
+            except Exception as exc:
+                log(f"[WARN] Experience text click failed: {exc}")
+            input_loc = page.locator("input[type='radio'], input[type='checkbox']").filter(has=page.locator(f"text={option_text}"))
+            if input_loc.count():
+                input_loc.first.check(force=True)
+            log(f"[EXPERIENCE] Selected {option_text}")
+    except Exception as exc:
+        log(f"[WARN] Experience selection failed: {exc}")
 
 def find_apply_button(page):
     return click_any(page, ["Apply", "Apply now", "Apply on company site"], timeout=15000)
@@ -877,6 +984,8 @@ try:
         slow_wait(4)
 
         detect_invalid(page, response)
+        detect_not_found_and_delete(page)
+        handle_additional_verification(page)
         detect_captcha(page, reason="landing")
         external_info = detect_external_context(page, ctx)
         if external_info:
@@ -893,6 +1002,8 @@ try:
             slow_wait(4)
 
             detect_invalid(page)
+            detect_not_found_and_delete(page)
+            handle_additional_verification(page)
             detect_captcha(page, reason=f"step_{step+1}")
             external_info = detect_external_context(page, ctx)
             if external_info:
@@ -908,6 +1019,7 @@ try:
 
             handle_resume_screen(page)
             handle_inputs(page)
+            handle_relevant_experience(page)
             handle_distance_questions(page)
             handle_radios(page)
             handle_special_radios(page)
