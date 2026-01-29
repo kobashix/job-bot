@@ -117,6 +117,7 @@ class PlaywrightSession:
         await page.wait_for_load_state("networkidle")
         await self._detect_invalid(page, response)
         await self._detect_not_found_and_delete(page)
+        await self._update_job_metadata(page)
         await self._handle_additional_verification(page)
         await self._detect_non_remote_job(page)
         if await self._detect_already_applied(page):
@@ -139,6 +140,7 @@ class PlaywrightSession:
             await page.wait_for_load_state("networkidle")
             await self._detect_invalid(page, None)
             await self._detect_not_found_and_delete(page)
+            await self._update_job_metadata(page)
             await self._handle_additional_verification(page)
             await self._detect_non_remote_job(page)
             if await self._detect_already_applied(page):
@@ -176,6 +178,9 @@ class PlaywrightSession:
     async def _detect_invalid(self, page, response) -> None:
         status = response.status if response is not None else None
         if status and status >= 400:
+            if status in {404, 410}:
+                await self.db.delete_job(self.job_url)
+                raise SessionExit(13, "deleted")
             await self.db.update_job(self.job_url, "invalid", f"http_status_{status}")
             raise InvalidJobPage(f"http_status_{status}")
         try:
@@ -205,10 +210,15 @@ class PlaywrightSession:
         except Exception as exc:
             self.logger.warning("Failed reading page text: %s", exc)
             return
-        if "this job has expired on indeed" in body or "this job has expired on indeed" in title:
+        if (
+            "this job has expired on indeed" in body
+            or "this job has expired on indeed" in title
+            or "job has expired on indeed" in body
+            or "job expired on indeed" in body
+        ):
             await self.db.delete_job(self.job_url)
             raise SessionExit(13, "deleted")
-        if "not found" in body or "not found" in title:
+        if "not found" in body or "not found" in title or "404" in title or "404" in body:
             await self.db.delete_job(self.job_url)
             raise SessionExit(13, "deleted")
 
@@ -248,6 +258,7 @@ class PlaywrightSession:
             pass
 
         applied_locators = [
+            "button[aria-label='Applied']",
             "button:has-text('Applied')",
             "span:has-text('Applied')",
             "div:has-text('Applied')",
@@ -275,6 +286,48 @@ class PlaywrightSession:
             self.logger.info("Already applied text detected", extra=self._log_ctx("already_applied"))
             return True
         return False
+
+    async def _update_job_metadata(self, page) -> None:
+        title = await self._first_text(
+            page,
+            [
+                "h1",
+                "[data-testid*='jobTitle' i]",
+                ".jobsearch-JobInfoHeader-title",
+            ],
+        )
+        company = await self._first_text(
+            page,
+            [
+                "[data-testid*='companyName' i]",
+                ".jobsearch-CompanyInfoContainer a",
+                ".jobsearch-CompanyInfoContainer div",
+            ],
+        )
+        location = await self._first_text(
+            page,
+            [
+                "[data-testid*='location' i]",
+                ".jobsearch-JobInfoHeader-subtitle div",
+                ".jobsearch-JobInfoHeader-subtitle",
+            ],
+        )
+        try:
+            await self.db.update_job_metadata(self.job_url, title=title, company=company, location=location)
+        except Exception as exc:
+            self.logger.warning("Metadata update failed: %s", exc)
+
+    async def _first_text(self, page, selectors: list[str]) -> Optional[str]:
+        for selector in selectors:
+            locator = page.locator(selector)
+            try:
+                if await locator.count():
+                    text = (await locator.first.inner_text()).strip()
+                    if text:
+                        return text
+            except Exception:
+                continue
+        return None
 
     async def _handle_additional_verification(self, page) -> None:
         try:

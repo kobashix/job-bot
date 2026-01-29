@@ -94,6 +94,33 @@ class DBClient:
         query = f"UPDATE jobs SET {', '.join(fields)} WHERE job_url = ?"
         return await self._execute(query, tuple(values))
 
+    async def update_job_metadata(
+        self,
+        job_url: str,
+        title: Optional[str] = None,
+        company: Optional[str] = None,
+        location: Optional[str] = None,
+    ) -> DBResult:
+        """Update job metadata fields when available."""
+
+        fields = []
+        values = []
+        if title:
+            fields.append("title = ?")
+            values.append(title)
+        if company:
+            fields.append("company = ?")
+            values.append(company)
+        if location:
+            fields.append("location = ?")
+            values.append(location)
+        if not fields:
+            return DBResult(True, 0)
+        fields.append("updated_at = CURRENT_TIMESTAMP")
+        values.append(job_url)
+        query = f"UPDATE jobs SET {', '.join(fields)} WHERE job_url = ?"
+        return await self._execute(query, tuple(values))
+
     async def delete_job(self, job_url: str) -> DBResult:
         """Delete job from the database."""
 
