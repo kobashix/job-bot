@@ -126,6 +126,13 @@ class PlaywrightSession:
         await self._detect_captcha(page, "landing")
 
     async def _handle_landing(self, page, context) -> None:
+        try:
+            await page.wait_for_selector(
+                "button[aria-label='Applied'], button:has-text('Apply'), a:has-text('Apply now')",
+                timeout=5000,
+            )
+        except Exception:
+            pass
         if await self._detect_already_applied(page):
             raise SessionExit(0, "already_applied")
         external_info = await self._detect_external_context(page, context)
@@ -219,8 +226,8 @@ class PlaywrightSession:
             or "job has expired on indeed" in body
             or "job expired on indeed" in body
         ):
-            await self.db.delete_job(self.job_url)
-            raise SessionExit(13, "deleted")
+            await self.db.update_job(self.job_url, "invalid", "expired_on_indeed")
+            raise SessionExit(12, "expired")
         if "not found" in body or "not found" in title or "404" in title or "404" in body:
             await self.db.delete_job(self.job_url)
             raise SessionExit(13, "deleted")
@@ -384,12 +391,35 @@ class PlaywrightSession:
             self.logger.warning("Retry action failed: %s", exc)
 
     async def _find_apply_button(self, page) -> bool:
+        if await self._click_apply_selector(page):
+            return True
         return await self._click_any(
             page,
             ["Apply", "Apply now", "Apply on company site"],
             timeout=15000,
             allow_links=True,
         )
+
+    async def _click_apply_selector(self, page) -> bool:
+        selectors = [
+            "[data-testid*='indeedApplyButton' i]",
+            "[data-testid*='applyButton' i]",
+            "button:has-text('Apply')",
+        ]
+        for selector in selectors:
+            loc = page.locator(selector)
+            try:
+                if await loc.count() == 0:
+                    continue
+                await loc.first.scroll_into_view_if_needed()
+                self.last_action["label"] = "Apply"
+                self.last_action["fn"] = lambda l=loc.first: l.click(timeout=15000, force=True)
+                await loc.first.click(timeout=15000, force=True)
+                self.logger.info("Clicked apply CTA selector %s", selector)
+                return True
+            except Exception as exc:
+                self.logger.warning("Apply CTA click failed for %s: %s", selector, exc)
+        return False
 
     async def _click_any(self, page, labels, timeout: int, allow_links: bool = False) -> bool:
         for label in labels:
