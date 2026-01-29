@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+
+os.environ.setdefault("NODE_OPTIONS", "--no-deprecation")
 
 from core.session import InvalidJobPage, NavigationTimeout, PlaywrightSession, SessionExit
 from helpers.captcha import CaptchaConfig, CaptchaHandler

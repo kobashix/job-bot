@@ -16,6 +16,8 @@ from helpers.form_fill import FormFiller
 SUCCESS_TEXTS = [
     "application has been submitted",
     "thank you for applying",
+    "application submitted",
+    "thank you",
 ]
 
 BLOCK_TEXTS = [
@@ -144,8 +146,7 @@ class PlaywrightSession:
                 raise SessionExit(0, "external")
             await self._check_for_stall(page)
 
-            body = (await page.inner_text("body")).lower()
-            if any(text in body for text in SUCCESS_TEXTS):
+            if await self._is_success_page(page):
                 await self.db.update_job(self.job_url, "applied")
                 self.logger.info("Application submitted", extra=self._log_ctx("success"))
                 await page.close()
@@ -362,11 +363,7 @@ class PlaywrightSession:
                 await self._external_fail("navigation_blocked", "submit_blocked", active_page, final_url, ats)
             if submit_result == "submitted":
                 await active_page.wait_for_load_state("networkidle")
-                try:
-                    body = (await active_page.inner_text("body")).lower()
-                except Exception:
-                    body = ""
-                if any(t in body for t in SUCCESS_TEXTS):
+                if await self._is_success_page(active_page):
                     await self.db.update_job(
                         self.job_url,
                         "applied",
@@ -519,6 +516,23 @@ class PlaywrightSession:
             if token in body:
                 return name
         return "unknown_external"
+
+    async def _is_success_page(self, page) -> bool:
+        try:
+            body = (await page.inner_text("body")).lower()
+            title = (await page.title()).lower()
+        except Exception as exc:
+            self.logger.warning("Failed reading page text: %s", exc)
+            body, title = "", ""
+        if any(text in body or text in title for text in SUCCESS_TEXTS):
+            return True
+        locator = page.locator("text=/application has been submitted|application submitted|thank you for applying/i")
+        try:
+            if await locator.count() and await locator.first.is_visible():
+                return True
+        except Exception:
+            return False
+        return False
 
     def _format_external_reason(self, final_url: str, ats: str, reason: str) -> str:
         ts = datetime.now().isoformat()
