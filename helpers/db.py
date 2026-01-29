@@ -51,7 +51,10 @@ class DBClient:
             SELECT job_url
             FROM jobs
             WHERE applied = 0
-              AND (status IS NULL OR status NOT IN ({placeholders}))
+              AND (
+                status IS NULL
+                OR (status NOT IN ({placeholders}) AND status NOT LIKE 'ERROR_%')
+              )
             LIMIT ?
         """.format(placeholders=", ".join("?" for _ in excluded_statuses))
         params = (*excluded_statuses, limit)
@@ -86,7 +89,7 @@ class DBClient:
             "last_error = ?",
             "updated_at = CURRENT_TIMESTAMP",
         ]
-        values = [1 if status == "applied" else 0, status, reason]
+        values = [1 if status in {"applied", "APPLIED"} else 0, status, reason]
         if is_external is not None:
             fields.append("is_external = ?")
             values.append(1 if is_external else 0)

@@ -54,7 +54,7 @@ class FormFiller:
         "ethnicity": "Not Hispanic or Latino",
         "race": "White",
         "veteran": "No",
-        "disability": "No, I do not have a disability",
+        "disability": "No, I do not have a disability and have not had one in the past",
     }
 
     def __init__(
@@ -95,7 +95,12 @@ class FormFiller:
                     await el.fill("Andrew Pennington")
                     self.logger.info("Filled voluntary self-identification name")
                     self._record("voluntary name", "Andrew Pennington")
-                elif "your name" in context or "full name" in context or "name" in context:
+                elif "your name" in context:
+                    await el.scroll_into_view_if_needed()
+                    await el.fill("Andrew Pennington")
+                    self.logger.info("Filled name")
+                    self._record("full name", "Andrew Pennington")
+                elif "full name" in context or "name" in context:
                     await el.scroll_into_view_if_needed()
                     await el.fill(self.profile.full_name)
                     self.logger.info("Filled name")
@@ -125,7 +130,7 @@ class FormFiller:
                     await el.fill(self.profile.compensation_range)
                     self.logger.info("Filled compensation range")
                     self._record("compensation", self.profile.compensation_range)
-                elif "today" in context or "date" in context:
+                elif "today's date" in context or "todays date" in context or "today" in context or "date" in context:
                     today = datetime.now().strftime("%m/%d/%Y")
                     await el.scroll_into_view_if_needed()
                     await el.fill(today)
@@ -176,6 +181,8 @@ class FormFiller:
             body = (await page.inner_text("body")).lower()
         except Exception:
             body = ""
+        if "voluntary self identification" in body:
+            await self._handle_voluntary_self_identification(page)
         merged = {**self.DEFAULT_EEO, **self.profile.eeo}
         for key, val in merged.items():
             if key in body:
@@ -253,6 +260,40 @@ class FormFiller:
             self._record("relevant_experience", option_text)
         except Exception as exc:
             self.logger.warning("Experience selection failed: %s", exc)
+
+    async def _handle_voluntary_self_identification(self, page) -> None:
+        selections = {
+            "Gender": "Male",
+            "Ethnicity": "Not Hispanic or Latino",
+            "Race": "White",
+            "Disability": "No, I do not have a disability and have not had one in the past",
+            "Veteran": "No",
+        }
+        for label, value in selections.items():
+            if await self._select_by_label_text(page, value):
+                self.logger.info("Selected voluntary self-identification %s", value)
+                self._record(label.lower(), value)
+                continue
+            self.logger.warning("Voluntary self-identification option not found: %s", value)
+
+    async def _select_by_label_text(self, page, value: str) -> bool:
+        label_locator = self.cache.get(page, f"label:has-text('{value}')")
+        if await label_locator.count():
+            try:
+                await label_locator.first.scroll_into_view_if_needed()
+                await label_locator.first.click(force=True)
+                return True
+            except Exception as exc:
+                self.logger.warning("Voluntary label click failed for %s: %s", value, exc)
+        radio_locator = self.cache.get(page, f"input[type='radio'] >> xpath=.. >> text={value}")
+        if await radio_locator.count():
+            try:
+                await radio_locator.first.scroll_into_view_if_needed()
+                await radio_locator.first.click(force=True)
+                return True
+            except Exception as exc:
+                self.logger.warning("Voluntary radio click failed for %s: %s", value, exc)
+        return False
 
     async def external_fill_inputs(self, page) -> None:
         inputs = self.cache.get(page, "input[type='text'], input[type='email'], input[type='tel'], textarea")
@@ -407,9 +448,8 @@ class FormFiller:
             await page.wait_for_timeout(500)
 
     async def _ensure_first_resume_selected(self, page) -> bool:
-        cards = page.locator("[role='radio'], input[type='radio']")
-        if not await cards.count():
-            cards = self.cache.get(page, "text=Use your Indeed Resume")
+        preferred = self.cache.get(page, "text=Use your Indeed Resume")
+        cards = preferred if await preferred.count() else page.locator("[role='radio'], input[type='radio']")
         if not await cards.count():
             self.logger.warning("Resume options not found on resume screen")
             return False
@@ -422,6 +462,11 @@ class FormFiller:
             self.logger.warning("Resume selection check failed: %s", exc)
             selected = False
         if selected:
+            try:
+                await card.scroll_into_view_if_needed()
+                await card.click(force=True)
+            except Exception:
+                pass
             return True
         try:
             await card.scroll_into_view_if_needed()
@@ -434,15 +479,16 @@ class FormFiller:
     async def _click_continue(self, page, min_wait_s: int, max_wait_s: int) -> None:
         start = datetime.now().timestamp()
         last_error = None
-        while datetime.now().timestamp() - start < max_wait_s:
+        attempts = 0
+        candidates = [
+            page.get_by_role("button", name="Continue"),
+            page.locator("button:has-text('Continue')"),
+            page.locator("a:has-text('Continue')"),
+        ]
+        while datetime.now().timestamp() - start < max_wait_s and attempts < 3:
             if datetime.now().timestamp() - start < min_wait_s:
                 await page.wait_for_timeout(1000)
                 continue
-            candidates = [
-                page.get_by_role("button", name="Continue"),
-                page.locator("button:has-text('Continue')"),
-                page.locator("a:has-text('Continue')"),
-            ]
             for button in candidates:
                 if not await button.count():
                     continue
@@ -453,7 +499,15 @@ class FormFiller:
                     return
                 except Exception as exc:
                     last_error = exc
+                    attempts += 1
                     self.logger.warning("Resume Continue click failed: %s", exc)
+                    try:
+                        await button.first.click(timeout=15000, force=True)
+                        self.logger.info("Clicked Continue on resume screen with force")
+                        return
+                    except Exception as force_exc:
+                        last_error = force_exc
+                        self.logger.warning("Resume Continue force click failed: %s", force_exc)
             await page.wait_for_timeout(1000)
         if last_error:
             self.logger.warning("Resume Continue click failed after retries: %s", last_error)

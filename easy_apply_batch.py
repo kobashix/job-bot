@@ -3,20 +3,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sqlite3
 import sys
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Iterable, Optional
 
 from helpers.db import DBClient
 from helpers.utils import ContextLogger, load_config, setup_logging
 
 
-RETRYABLE_STATUSES = (
-    "applied",
-    "external_pending",
-    "disqualified",
-    "captcha_pending",
-    "failed_with_reason",
+TERMINAL_STATUSES = (
+    "APPLIED",
+    "EXTERNAL_APPLY",
+    "NOT_REMOTE",
+    "EXPIRED",
+    "CAPTCHA_BLOCKED",
 )
 
 
@@ -33,25 +34,33 @@ class BatchRunner:
         self.db = db
         self.logger = logger
         self.python_exe = python_exe
+        self.status_counts: dict[str, int] = {}
 
     async def run(self, limit: int) -> BatchResult:
-        jobs = await self.db.fetch_jobs(limit, RETRYABLE_STATUSES)
+        jobs = await self.db.fetch_jobs(limit, TERMINAL_STATUSES)
         self.logger.info("Starting batch apply: %s jobs", len(jobs))
         result = BatchResult()
 
         for idx, (url,) in enumerate(jobs, 1):
             self.logger.info("[%s/%s] Applying to: %s", idx, len(jobs), url)
             returncode, output = await self._run_single(url)
+            status = await self._fetch_status(url)
             if returncode == 0:
                 result.success += 1
             else:
                 result.failed += 1
-                await self._mark_failure(url, returncode, output)
+                await self._mark_failure(url, returncode, output, status)
+                status = await self._fetch_status(url)
+            if status:
+                self.status_counts[status] = self.status_counts.get(status, 0) + 1
             await asyncio.sleep(3)
 
         self.logger.info("Batch complete")
         self.logger.info("Successes: %s", result.success)
         self.logger.info("Failures: %s", result.failed)
+        if self.status_counts:
+            for status, count in sorted(self.status_counts.items()):
+                self.logger.info("Status %s: %s", status, count)
         if result.success == 0 and result.failed == 0:
             self.logger.warning(
                 "No jobs processed. Check filters, job status, or database contents."
@@ -75,22 +84,40 @@ class BatchRunner:
         returncode = await proc.wait()
         return returncode, "".join(output_lines)
 
-    async def _mark_failure(self, url: str, returncode: int, output: str) -> None:
+    async def _mark_failure(
+        self, url: str, returncode: int, output: str, current_status: Optional[str]
+    ) -> None:
+        if current_status and self._is_terminal(current_status):
+            return
         lowered = output.lower() if output else ""
         if "external" in lowered:
-            await self.db.update_job(url, "external_pending", "company_site", is_external=True)
+            await self.db.update_job(url, "EXTERNAL_APPLY", "company_site", is_external=True)
             return
         if "captcha" in lowered:
-            await self.db.update_job(url, "captcha_pending", "captcha_pending")
+            await self.db.update_job(url, "CAPTCHA_BLOCKED", "captcha_detected")
             return
-        if "disqualified" in lowered or "expired" in lowered:
-            await self.db.update_job(url, "disqualified", "disqualified_batch")
+        if "expired" in lowered or "not found" in lowered:
+            await self.db.update_job(url, "EXPIRED", "expired_batch")
             return
-        if "invalid" in lowered or "404" in lowered:
-            await self.db.update_job(url, "failed_with_reason", "invalid_job")
+        if "not remote" in lowered or "non_remote" in lowered:
+            await self.db.update_job(url, "NOT_REMOTE", "not_remote_batch")
             return
-        fallback_reason = output[-500:] if output else f"failed_returncode_{returncode}"
-        await self.db.update_job(url, "failed_with_reason", fallback_reason)
+        reason = output[-500:] if output else f"returncode_{returncode}"
+        await self.db.update_job(url, f"ERROR_returncode_{returncode}", reason)
+
+    async def _fetch_status(self, url: str) -> Optional[str]:
+        def _fetch_sync() -> Optional[str]:
+            with sqlite3.connect(self.db.db_path, timeout=30) as conn:
+                row = conn.execute(
+                    "SELECT status FROM jobs WHERE job_url = ?",
+                    (url,),
+                ).fetchone()
+                return row[0] if row else None
+
+        return await asyncio.to_thread(_fetch_sync)
+
+    def _is_terminal(self, status: str) -> bool:
+        return status in TERMINAL_STATUSES or status.startswith("ERROR_")
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
