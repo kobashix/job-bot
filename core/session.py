@@ -126,6 +126,8 @@ class PlaywrightSession:
         await self._detect_captcha(page, "landing")
 
     async def _handle_landing(self, page, context) -> None:
+        if await self._detect_already_applied(page):
+            raise SessionExit(0, "already_applied")
         external_info = await self._detect_external_context(page, context)
         if external_info:
             await self._external_apply_handler(page, context, external_info)
@@ -249,6 +251,14 @@ class PlaywrightSession:
             raise SessionExit(14, "non_remote")
 
     async def _detect_already_applied(self, page) -> bool:
+        try:
+            await page.wait_for_selector(
+                "button[aria-label='Applied'], span:has-text('Applied'), div:has-text('Applied')",
+                timeout=3000,
+                state="visible",
+            )
+        except Exception:
+            pass
         try:
             applied_button = page.get_by_role("button", name="Applied")
             if await applied_button.count() and await applied_button.first.is_visible():
