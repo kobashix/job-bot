@@ -45,7 +45,13 @@ EXTERNAL_HOST_KEYWORDS = [
 EXTERNAL_BUTTON_LABELS = ["Apply on company site", "Apply externally"]
 EXTERNAL_ACTION_LABELS = ["Apply", "Next", "Continue"]
 EXTERNAL_FINAL_SUBMIT_LABELS = ["Submit application", "Finish", "Complete application"]
-FINAL_STATUSES = ("applied", "external_pending", "disqualified", "captcha_pending", "failed_with_reason")
+FINAL_STATUSES = (
+    "APPLIED",
+    "EXTERNAL_APPLY",
+    "NOT_REMOTE",
+    "EXPIRED",
+    "CAPTCHA_BLOCKED",
+)
 CLICK_RETRY_BASE_SECONDS = 0.6
 CLICK_RETRY_MAX_SECONDS = 5.0
 
@@ -116,7 +122,7 @@ class PlaywrightSession:
         try:
             response = await page.goto(self.job_url, timeout=60000)
         except PWTimeout as exc:
-            await self.db.update_job(self.job_url, "failed_with_reason", "navigation_timeout")
+            await self.db.update_job(self.job_url, "ERROR_navigation_timeout", "navigation_timeout")
             raise NavigationTimeout(str(exc))
         await page.wait_for_load_state("networkidle")
         await self._detect_invalid(page, response)
@@ -138,13 +144,19 @@ class PlaywrightSession:
             pass
         if await self._detect_already_applied(page):
             raise SessionExit(0, "already_applied")
+        apply_state = await self._detect_apply_cta(page)
+        if apply_state == "external":
+            await self.db.update_job(self.job_url, "EXTERNAL_APPLY", "company_site", is_external=True)
+            raise SessionExit(0, "external")
+        if apply_state == "easy_apply":
+            return
         external_info = await self._detect_external_context(page, context)
         if external_info:
             await self._external_apply_handler(page, context, external_info)
             raise SessionExit(0, "external")
         if not await self._find_apply_button(page):
             self._log_failure("find_apply_button", "missing_apply_button", "landing")
-            await self.db.update_job(self.job_url, "failed_with_reason", "missing_apply_button")
+            await self.db.update_job(self.job_url, "ERROR_missing_apply_button", "missing_apply_button")
             raise SessionExit(10, "no_apply")
 
     async def _apply_loop(self, page, context) -> None:
@@ -167,7 +179,7 @@ class PlaywrightSession:
             await self._check_for_stall(page)
 
             if await self._is_success_page(page):
-                await self.db.update_job(self.job_url, "applied")
+                await self.db.update_job(self.job_url, "APPLIED", "application_submitted")
                 self.logger.info("Application submitted", extra=self._log_ctx("success"))
                 await page.close()
                 raise SessionExit(0, "applied")
@@ -183,7 +195,7 @@ class PlaywrightSession:
             if await self._click_any(
                 page,
                 ["Continue", "Next", "Review", "Submit", "Submit application", "Submit your application"],
-                timeout=20000,
+                timeout=30000,
             ):
                 await asyncio.sleep(1)
                 await page.wait_for_load_state("networkidle")
@@ -196,7 +208,7 @@ class PlaywrightSession:
             await asyncio.sleep(1)
 
         self._log_failure("apply_loop", "max_steps", "apply_loop")
-        await self.db.update_job(self.job_url, "failed_with_reason", "max_steps")
+        await self.db.update_job(self.job_url, "ERROR_max_steps", "max_steps")
         raise SessionExit(99, "max_steps")
 
     async def _detect_invalid(self, page, response) -> None:
@@ -204,10 +216,10 @@ class PlaywrightSession:
         if status and status >= 400:
             if status in {404, 410}:
                 self._log_failure("load_page", f"http_status_{status}", "navigate")
-                await self.db.update_job(self.job_url, "failed_with_reason", f"http_status_{status}")
+                await self.db.update_job(self.job_url, "EXPIRED", f"http_status_{status}")
                 raise InvalidJobPage(f"http_status_{status}")
             self._log_failure("load_page", f"http_status_{status}", "navigate")
-            await self.db.update_job(self.job_url, "failed_with_reason", f"http_status_{status}")
+            await self.db.update_job(self.job_url, f"ERROR_http_status_{status}", f"http_status_{status}")
             raise InvalidJobPage(f"http_status_{status}")
         try:
             body = (await page.inner_text("body")).lower()
@@ -220,13 +232,16 @@ class PlaywrightSession:
             "job is no longer available",
             "job has expired",
             "this job is no longer available",
+            "this job has expired",
+            "we can't find this page",
+            "we can’t find this page",
             "404",
             "page not found",
             "not found",
         ]
         for text in invalid_texts:
             if text in body or text in title:
-                status = "disqualified" if "expired" in text else "failed_with_reason"
+                status = "EXPIRED" if ("expired" in text or "find this page" in text or "404" in text) else "ERROR_invalid_page"
                 self._log_failure("page_validation", f"invalid_text:{text}", "navigate")
                 await self.db.update_job(self.job_url, status, f"invalid_text:{text}")
                 raise InvalidJobPage(text)
@@ -244,12 +259,12 @@ class PlaywrightSession:
             or "job has expired on indeed" in body
             or "job expired on indeed" in body
         ):
-            await self.db.update_job(self.job_url, "disqualified", "expired_on_indeed")
+            await self.db.update_job(self.job_url, "EXPIRED", "expired_on_indeed")
             self._log_failure("page_validation", "expired_on_indeed", "navigate")
             raise SessionExit(12, "expired")
         if "not found" in body or "not found" in title or "404" in title or "404" in body:
             self._log_failure("page_validation", "not_found", "navigate")
-            await self.db.update_job(self.job_url, "failed_with_reason", "not_found")
+            await self.db.update_job(self.job_url, "EXPIRED", "not_found")
             raise SessionExit(13, "deleted")
 
     async def _detect_non_remote_job(self, page) -> None:
@@ -276,19 +291,34 @@ class PlaywrightSession:
         except Exception as exc:
             self.logger.warning("Failed reading page text for disqualification: %s", exc)
             body, title = "", ""
-        if "hybrid" in body or "hybrid" in title:
-            self._log_failure("disqualification", "hybrid_role", "navigate")
-            await self.db.update_job(self.job_url, "disqualified", "disqualified:hybrid_role")
+        non_remote_phrases = [
+            "hybrid work",
+            "work location: in person",
+            "on-site",
+            "on site",
+            "estimated commute",
+        ]
+        if any(phrase in body or phrase in title for phrase in non_remote_phrases):
+            self._log_failure("disqualification", "non_remote_phrase", "navigate")
+            await self.db.update_job(self.job_url, "NOT_REMOTE", "not_remote:phrase_match")
             raise SessionExit(14, "disqualified")
         for text in location_candidates:
             if "remote" in text.lower():
                 return
+            if "," in text and any(part.strip().isalpha() and len(part.strip()) == 2 for part in text.split(",")):
+                self._log_failure("disqualification", "city_state_location", "navigate")
+                await self.db.update_job(
+                    self.job_url,
+                    "NOT_REMOTE",
+                    f"not_remote:city_state:{text[:200]}",
+                )
+                raise SessionExit(14, "disqualified")
         if location_candidates and "remote" not in body:
             self._log_failure("disqualification", "non_remote_location", "navigate")
             await self.db.update_job(
                 self.job_url,
-                "disqualified",
-                f"disqualified:non_remote_location:{location_candidates[0][:200]}",
+                "NOT_REMOTE",
+                f"not_remote:location:{location_candidates[0][:200]}",
             )
             raise SessionExit(14, "disqualified")
 
@@ -304,7 +334,7 @@ class PlaywrightSession:
         try:
             applied_button = page.get_by_role("button", name="Applied")
             if await applied_button.count() and await applied_button.first.is_visible():
-                await self.db.update_job(self.job_url, "applied", "already_applied")
+                await self.db.update_job(self.job_url, "APPLIED", "already_applied")
                 self.logger.info("Already applied badge detected", extra=self._log_ctx("already_applied"))
                 return True
         except Exception:
@@ -324,7 +354,7 @@ class PlaywrightSession:
             locator = page.locator(selector)
             try:
                 if await locator.count() and await locator.first.is_visible():
-                    await self.db.update_job(self.job_url, "applied", "already_applied")
+                    await self.db.update_job(self.job_url, "APPLIED", "already_applied")
                     self.logger.info("Already applied badge detected", extra=self._log_ctx("already_applied"))
                     return True
             except Exception:
@@ -335,7 +365,7 @@ class PlaywrightSession:
         except Exception:
             body = ""
         if "applied" in body and "apply" in body:
-            await self.db.update_job(self.job_url, "applied", "already_applied_text")
+            await self.db.update_job(self.job_url, "APPLIED", "already_applied_text")
             self.logger.info("Already applied text detected", extra=self._log_ctx("already_applied"))
             return True
         return False
@@ -390,19 +420,13 @@ class PlaywrightSession:
             self.logger.warning("Failed reading page text: %s", exc)
             return
         if "additional verification needed" in body or "additional verification needed" in title:
-            await self.db.update_job(self.job_url, "captcha_pending", "additional_verification")
+            await self.db.update_job(self.job_url, "CAPTCHA_BLOCKED", "additional_verification")
             try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(
-                        input, "CAPTCHA DETECTED — complete manually and press ENTER to continue\n"
-                    ),
-                    timeout=self.config.captcha_wait_seconds,
+                await asyncio.to_thread(
+                    input, "[CAPTCHA] Solve manually, then press ENTER to continue\n"
                 )
-            except asyncio.TimeoutError:
-                await self.db.update_job(self.job_url, "captcha_pending", "verification_timeout")
-                raise SessionExit(21, "verification_timeout")
             except EOFError:
-                await self.db.update_job(self.job_url, "captcha_pending", "verification_prompt_failed")
+                await self.db.update_job(self.job_url, "CAPTCHA_BLOCKED", "verification_prompt_failed")
                 raise SessionExit(21, "verification_prompt_failed")
 
     async def _detect_captcha(self, page, reason: str) -> None:
@@ -411,12 +435,55 @@ class PlaywrightSession:
         except CaptchaDetected as exc:
             await self.db.update_job(
                 self.job_url,
-                "captcha_pending",
+                "CAPTCHA_BLOCKED",
                 exc.reason,
                 is_external=exc.is_external,
             )
             await self.captcha.resolve(exc.reason)
             await self._retry_last_action()
+
+    async def _detect_apply_cta(self, page) -> Optional[str]:
+        external_labels = ["Apply on company site"]
+        easy_apply_labels = ["Apply now"]
+        for label in external_labels:
+            for locator in self._text_first_locators(page, label, allow_links=True):
+                try:
+                    if await locator.count():
+                        await locator.first.scroll_into_view_if_needed()
+                        if await locator.first.is_visible():
+                            self.logger.info("External apply CTA detected: %s", label)
+                            return "external"
+                except Exception:
+                    continue
+        for label in easy_apply_labels:
+            for locator in self._text_first_locators(page, label, allow_links=True):
+                try:
+                    if await locator.count():
+                        self.last_action["label"] = label
+                        self.last_action["fn"] = lambda l=locator.first: self._safe_click(
+                            l, label, timeout=30000, allow_force=True
+                        )
+                        if await self._safe_click(locator.first, label, timeout=30000, allow_force=True):
+                            self.logger.info("Clicked %s", label, extra=self._log_ctx("apply"))
+                            return "easy_apply"
+                except Exception as exc:
+                    self.logger.warning("Apply CTA click failed for %s: %s", label, exc)
+        return None
+
+    def _text_first_locators(self, page, label: str, allow_links: bool = False) -> list:
+        locators = []
+        try:
+            locators.append(page.get_by_role("button", name=label))
+        except Exception:
+            pass
+        locators.append(page.locator(f"button:has-text('{label}')"))
+        if allow_links:
+            try:
+                locators.append(page.get_by_role("link", name=label))
+            except Exception:
+                pass
+            locators.append(page.locator(f"a:has-text('{label}')"))
+        return locators
 
     async def _retry_last_action(self) -> None:
         if self.last_action["fn"] is None:
@@ -432,8 +499,8 @@ class PlaywrightSession:
             return True
         return await self._click_any(
             page,
-            ["Apply now", "Apply", "Continue", "Next", "Submit application", "Apply on company site"],
-            timeout=15000,
+            ["Apply now", "Apply", "Continue", "Next", "Submit application"],
+            timeout=30000,
             allow_links=True,
         )
 
@@ -450,9 +517,9 @@ class PlaywrightSession:
                     continue
                 self.last_action["label"] = "Apply"
                 self.last_action["fn"] = lambda l=loc.first: self._safe_click(
-                    l, "Apply", timeout=15000, allow_force=True
+                    l, "Apply", timeout=30000, allow_force=True
                 )
-                if await self._safe_click(loc.first, "Apply", timeout=15000, allow_force=True):
+                if await self._safe_click(loc.first, "Apply", timeout=30000, allow_force=True):
                     self.logger.info("Clicked apply CTA selector %s", selector)
                     return True
             except Exception as exc:
@@ -526,7 +593,7 @@ class PlaywrightSession:
         ats_hint = await self._detect_ats(active_page.url, active_page)
         await self.db.update_job(
             self.job_url,
-            "external_pending",
+            "EXTERNAL_APPLY",
             self._format_external_reason(
                 active_page.url,
                 ats_hint,
@@ -564,10 +631,10 @@ class PlaywrightSession:
             submit_result = await self._external_handle_submit(active_page)
             if submit_result == "confirmation_unavailable":
                 await self._external_fail(
-                    "failed_with_reason", "confirmation_unavailable", active_page, final_url, ats
+                    "ERROR_confirmation_unavailable", "confirmation_unavailable", active_page, final_url, ats
                 )
             if submit_result == "navigation_blocked":
-                await self._external_fail("failed_with_reason", "submit_blocked", active_page, final_url, ats)
+                await self._external_fail("ERROR_submit_blocked", "submit_blocked", active_page, final_url, ats)
             if submit_result == "skipped":
                 self.logger.info("Training mode: skipping external submit", extra=self._log_ctx("train_skip"))
                 continue
@@ -576,7 +643,7 @@ class PlaywrightSession:
                 if await self._is_success_page(active_page):
                     await self.db.update_job(
                         self.job_url,
-                        "applied",
+                        "APPLIED",
                         self._format_external_reason(active_page.url, ats, "external_applied"),
                         is_external=True,
                     )
@@ -584,7 +651,7 @@ class PlaywrightSession:
                     raise SessionExit(0, "applied")
                 await self.db.update_job(
                     self.job_url,
-                    "external_pending",
+                    "EXTERNAL_APPLY",
                     self._format_external_reason(active_page.url, ats, "submitted_no_confirmation"),
                     is_external=True,
                 )
@@ -596,13 +663,13 @@ class PlaywrightSession:
 
             if await self._external_detect_required_errors(active_page):
                 await self._external_fail(
-                    "failed_with_reason", "required_fields", active_page, final_url, ats
+                    "ERROR_required_fields", "required_fields", active_page, final_url, ats
                 )
 
             self.logger.info("External flow: no actionable button")
             await asyncio.sleep(2)
 
-        await self._external_fail("failed_with_reason", "max_steps", active_page, final_url, ats)
+        await self._external_fail("ERROR_max_steps", "max_steps", active_page, final_url, ats)
 
     async def _external_handle_submit(self, page) -> Optional[str]:
         for label in EXTERNAL_FINAL_SUBMIT_LABELS:
@@ -703,7 +770,7 @@ class PlaywrightSession:
             await self._click_any(
                 page,
                 ["Continue", "Next", "Review", "Submit", "Submit application", "Submit your application"],
-                timeout=8000,
+                timeout=30000,
             )
             await self._update_progress_marker(page)
         elif url != self.progress.url or value != self.progress.value:
