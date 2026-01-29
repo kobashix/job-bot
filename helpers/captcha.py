@@ -100,12 +100,7 @@ class CaptchaHandler:
 
         self.logger.warning("Captcha detected: %s", prompt)
         try:
-            await asyncio.wait_for(
-                async_input("CAPTCHA DETECTED — complete manually and press ENTER to continue\n"),
-                timeout=self.wait_seconds,
-            )
-        except asyncio.TimeoutError:
-            self.logger.warning("Captcha wait timed out")
+            await async_input("[CAPTCHA] Solve manually, then press ENTER to continue\n")
         except EOFError:
             self.logger.warning("No stdin available to continue")
 
