@@ -47,6 +47,16 @@ def normalize_answer_key(text: str) -> str:
 class FormFiller:
     """Handles autofill logic for application forms."""
 
+    COMMUTE_KEYWORDS = ["commute", "commuting", "distance", "travel", "onsite", "on-site", "relocation", "relocate"]
+    VOLUNTARY_KEYWORDS = ["voluntary", "self-identification", "self identification", "eeo"]
+    DEFAULT_EEO = {
+        "gender": "Male",
+        "ethnicity": "Not Hispanic or Latino",
+        "race": "White",
+        "veteran": "No",
+        "disability": "No, I do not have a disability",
+    }
+
     def __init__(
         self,
         profile: UserProfile,
@@ -67,25 +77,11 @@ class FormFiller:
         if not (await resume_banner.count() or await resume_card.count() or await upload_option.count()):
             return
         self.logger.info("Waiting for resume options")
-        try:
-            await page.wait_for_selector("text=Use your Indeed Resume, text=Upload a resume", timeout=20000)
-        except Exception as exc:
-            self.logger.warning("Resume options not visible yet: %s", exc)
-        card = resume_card.first
-        try:
-            selected = (
-                await card.locator("[aria-checked='true'], [data-checked='true'], [data-selected='true']").count()
-            ) > 0
-        except Exception as exc:
-            self.logger.warning("Resume selection check failed: %s", exc)
-            selected = False
-        if not selected:
-            self.logger.info("Selecting Indeed resume")
-            try:
-                await card.scroll_into_view_if_needed()
-                await card.click(force=True)
-            except Exception as exc:
-                self.logger.warning("Resume card click failed: %s", exc)
+        await self._wait_for_resume_options(page, timeout_s=15)
+        selected = await self._ensure_first_resume_selected(page)
+        if selected:
+            self.logger.info("Resume option selected or already checked")
+        await self._click_continue(page, min_wait_s=10, max_wait_s=15)
         await page.wait_for_load_state("networkidle")
 
     async def handle_inputs(self, page) -> None:
@@ -94,7 +90,12 @@ class FormFiller:
             el = inputs.nth(i)
             context = await extract_context(el)
             try:
-                if "your name" in context or "full name" in context or "name" in context:
+                if "name" in context and any(k in context for k in self.VOLUNTARY_KEYWORDS):
+                    await el.scroll_into_view_if_needed()
+                    await el.fill("Andrew Pennington")
+                    self.logger.info("Filled voluntary self-identification name")
+                    self._record("voluntary name", "Andrew Pennington")
+                elif "your name" in context or "full name" in context or "name" in context:
                     await el.scroll_into_view_if_needed()
                     await el.fill(self.profile.full_name)
                     self.logger.info("Filled name")
@@ -132,9 +133,9 @@ class FormFiller:
                     self._record("today date", today)
                 elif "how many years" in context or "years of" in context:
                     await el.scroll_into_view_if_needed()
-                    await el.fill(self.profile.years_experience)
+                    await el.fill("15")
                     self.logger.info("Filled years")
-                    self._record("how many years", self.profile.years_experience)
+                    self._record("how many years", "15")
             except Exception as exc:
                 self.logger.warning("Input fill failed: %s", exc)
 
@@ -152,7 +153,12 @@ class FormFiller:
         for name, group in groups.items():
             if await self._group_has_checked(group):
                 continue
-            selected = await self._pick_first_visible(group)
+            group_text = await _fieldset_text(group[0])
+            selected = None
+            if any(k in group_text for k in self.COMMUTE_KEYWORDS):
+                selected = await self._pick_no_option(group)
+            if selected is None:
+                selected = await self._pick_first_visible(group)
             if selected is None:
                 continue
             label_text = await _label_text(selected)
@@ -170,7 +176,8 @@ class FormFiller:
             body = (await page.inner_text("body")).lower()
         except Exception:
             body = ""
-        for key, val in self.profile.eeo.items():
+        merged = {**self.DEFAULT_EEO, **self.profile.eeo}
+        for key, val in merged.items():
             if key in body:
                 loc = self.cache.get(page, f"label:has-text('{val}')")
                 if await loc.count():
@@ -181,9 +188,18 @@ class FormFiller:
                         self._record(key, val)
                     except Exception as exc:
                         self.logger.warning("EEO selection failed for %s: %s", val, exc)
+                else:
+                    radios = self.cache.get(page, "input[type='radio']")
+                    if await radios.count():
+                        try:
+                            await radios.first.scroll_into_view_if_needed()
+                            await radios.first.check(force=True)
+                            self.logger.info("Fallback EEO selection for %s", key)
+                        except Exception as exc:
+                            self.logger.warning("Fallback EEO selection failed for %s: %s", key, exc)
 
     async def handle_distance_questions(self, page) -> None:
-        keywords = ["commute", "commuting", "distance", "travel"]
+        keywords = self.COMMUTE_KEYWORDS
         try:
             body = (await page.inner_text("body")).lower()
         except Exception:
@@ -244,6 +260,10 @@ class FormFiller:
             el = inputs.nth(i)
             context = await extract_context(el)
             try:
+                if "name" in context and any(k in context for k in self.VOLUNTARY_KEYWORDS):
+                    await el.scroll_into_view_if_needed()
+                    await el.fill("Andrew Pennington")
+                    continue
                 if "first name" in context:
                     await el.scroll_into_view_if_needed()
                     await el.fill(self.profile.first_name)
@@ -261,7 +281,11 @@ class FormFiller:
                     await el.fill(self.profile.phone)
                 elif "how many years" in context:
                     await el.scroll_into_view_if_needed()
-                    await el.fill(self.profile.years_experience)
+                    await el.fill("15")
+                elif "today" in context or "date" in context:
+                    today = datetime.now().strftime("%m/%d/%Y")
+                    await el.scroll_into_view_if_needed()
+                    await el.fill(today)
             except Exception as exc:
                 self.logger.warning("External input fill failed: %s", exc)
 
@@ -288,7 +312,7 @@ class FormFiller:
                 self.logger.warning("External dropdown select failed: %s", exc)
 
     async def external_handle_radios(self, page) -> None:
-        keywords_no = ["commute", "commuting", "distance", "travel", "relocation", "relocate", "sponsorship", "visa"]
+        keywords_no = [*self.COMMUTE_KEYWORDS, "sponsorship", "visa"]
         radios = self.cache.get(page, "input[type='radio']")
         total = await radios.count()
         groups: Dict[str, list] = {}
@@ -306,11 +330,7 @@ class FormFiller:
             prefer_no = any(k in group_text for k in keywords_no)
             selected = None
             if prefer_no:
-                for radio in group:
-                    label_text = await _label_text(radio)
-                    if "no" in label_text.lower():
-                        selected = radio
-                        break
+                selected = await self._pick_no_option(group)
             if selected is None:
                 selected = await self._pick_first_visible(group)
             if selected is None:
@@ -331,7 +351,8 @@ class FormFiller:
             body = ""
         if not any(k in body for k in keywords):
             return
-        for key, val in self.profile.eeo.items():
+        merged = {**self.DEFAULT_EEO, **self.profile.eeo}
+        for key, val in merged.items():
             if key in body:
                 loc = self.cache.get(page, f"label:has-text('{val}')")
                 if await loc.count():
@@ -360,9 +381,82 @@ class FormFiller:
                 continue
         return None
 
+    async def _pick_no_option(self, group):
+        for radio in group:
+            label_text = await _label_text(radio)
+            if "no" in label_text.lower():
+                try:
+                    if await radio.is_enabled():
+                        return radio
+                except Exception:
+                    return radio
+        return None
+
     def _record(self, label: str, value: str) -> None:
         if self.train_mode:
             self.answers.record(label, value)
+
+    async def _wait_for_resume_options(self, page, timeout_s: int) -> None:
+        start = datetime.now().timestamp()
+        while datetime.now().timestamp() - start < timeout_s:
+            resume_choices = page.locator(
+                "[role='radio'], input[type='radio'], text=Use your Indeed Resume, text=Upload a resume"
+            )
+            if await resume_choices.count():
+                return
+            await page.wait_for_timeout(500)
+
+    async def _ensure_first_resume_selected(self, page) -> bool:
+        cards = page.locator("[role='radio'], input[type='radio']")
+        if not await cards.count():
+            cards = self.cache.get(page, "text=Use your Indeed Resume")
+        if not await cards.count():
+            self.logger.warning("Resume options not found on resume screen")
+            return False
+        card = cards.first
+        try:
+            selected = (
+                await card.locator("[aria-checked='true'], [data-checked='true'], [data-selected='true']").count()
+            ) > 0
+        except Exception as exc:
+            self.logger.warning("Resume selection check failed: %s", exc)
+            selected = False
+        if selected:
+            return True
+        try:
+            await card.scroll_into_view_if_needed()
+            await card.click(force=True)
+            return True
+        except Exception as exc:
+            self.logger.warning("Resume card click failed: %s", exc)
+            return False
+
+    async def _click_continue(self, page, min_wait_s: int, max_wait_s: int) -> None:
+        start = datetime.now().timestamp()
+        last_error = None
+        while datetime.now().timestamp() - start < max_wait_s:
+            if datetime.now().timestamp() - start < min_wait_s:
+                await page.wait_for_timeout(1000)
+                continue
+            candidates = [
+                page.get_by_role("button", name="Continue"),
+                page.locator("button:has-text('Continue')"),
+                page.locator("a:has-text('Continue')"),
+            ]
+            for button in candidates:
+                if not await button.count():
+                    continue
+                try:
+                    await button.first.scroll_into_view_if_needed()
+                    await button.first.click(timeout=15000)
+                    self.logger.info("Clicked Continue on resume screen")
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    self.logger.warning("Resume Continue click failed: %s", exc)
+            await page.wait_for_timeout(1000)
+        if last_error:
+            self.logger.warning("Resume Continue click failed after retries: %s", last_error)
 
 
 async def extract_context(el) -> str:

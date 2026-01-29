@@ -45,6 +45,9 @@ EXTERNAL_HOST_KEYWORDS = [
 EXTERNAL_BUTTON_LABELS = ["Apply on company site", "Apply externally"]
 EXTERNAL_ACTION_LABELS = ["Apply", "Next", "Continue"]
 EXTERNAL_FINAL_SUBMIT_LABELS = ["Submit application", "Finish", "Complete application"]
+FINAL_STATUSES = ("applied", "external_pending", "disqualified", "captcha_pending", "failed_with_reason")
+CLICK_RETRY_BASE_SECONDS = 0.6
+CLICK_RETRY_MAX_SECONDS = 5.0
 
 
 class NavigationTimeout(Exception):
@@ -113,7 +116,7 @@ class PlaywrightSession:
         try:
             response = await page.goto(self.job_url, timeout=60000)
         except PWTimeout as exc:
-            await self.db.update_job(self.job_url, "failed", "navigation_timeout")
+            await self.db.update_job(self.job_url, "failed_with_reason", "navigation_timeout")
             raise NavigationTimeout(str(exc))
         await page.wait_for_load_state("networkidle")
         await self._detect_invalid(page, response)
@@ -140,7 +143,8 @@ class PlaywrightSession:
             await self._external_apply_handler(page, context, external_info)
             raise SessionExit(0, "external")
         if not await self._find_apply_button(page):
-            await self.db.update_job(self.job_url, "no_apply", "missing_apply_button")
+            self._log_failure("find_apply_button", "missing_apply_button", "landing")
+            await self.db.update_job(self.job_url, "failed_with_reason", "missing_apply_button")
             raise SessionExit(10, "no_apply")
 
     async def _apply_loop(self, page, context) -> None:
@@ -174,24 +178,36 @@ class PlaywrightSession:
             await self.form_filler.handle_distance_questions(page)
             await self.form_filler.handle_radios(page)
             await self.form_filler.handle_special_radios(page)
+            await asyncio.sleep(0.8)
 
-            if await self._click_any(page, ["Continue", "Review", "Submit", "Submit your application"], timeout=20000):
+            if await self._click_any(
+                page,
+                ["Continue", "Next", "Review", "Submit", "Submit application", "Submit your application"],
+                timeout=20000,
+            ):
+                await asyncio.sleep(1)
                 await page.wait_for_load_state("networkidle")
                 continue
 
-            self.logger.info("No actionable button found", extra=self._log_ctx("wait"))
+            self.logger.info(
+                "No actionable button found at %s", page.url, extra=self._log_ctx("wait")
+            )
             await page.wait_for_load_state("networkidle")
+            await asyncio.sleep(1)
 
-        await self.db.update_job(self.job_url, "failed", "max_steps")
+        self._log_failure("apply_loop", "max_steps", "apply_loop")
+        await self.db.update_job(self.job_url, "failed_with_reason", "max_steps")
         raise SessionExit(99, "max_steps")
 
     async def _detect_invalid(self, page, response) -> None:
         status = response.status if response is not None else None
         if status and status >= 400:
             if status in {404, 410}:
-                await self.db.delete_job(self.job_url)
-                raise SessionExit(13, "deleted")
-            await self.db.update_job(self.job_url, "invalid", f"http_status_{status}")
+                self._log_failure("load_page", f"http_status_{status}", "navigate")
+                await self.db.update_job(self.job_url, "failed_with_reason", f"http_status_{status}")
+                raise InvalidJobPage(f"http_status_{status}")
+            self._log_failure("load_page", f"http_status_{status}", "navigate")
+            await self.db.update_job(self.job_url, "failed_with_reason", f"http_status_{status}")
             raise InvalidJobPage(f"http_status_{status}")
         try:
             body = (await page.inner_text("body")).lower()
@@ -210,7 +226,9 @@ class PlaywrightSession:
         ]
         for text in invalid_texts:
             if text in body or text in title:
-                await self.db.update_job(self.job_url, "invalid", f"invalid_text:{text}")
+                status = "disqualified" if "expired" in text else "failed_with_reason"
+                self._log_failure("page_validation", f"invalid_text:{text}", "navigate")
+                await self.db.update_job(self.job_url, status, f"invalid_text:{text}")
                 raise InvalidJobPage(text)
 
     async def _detect_not_found_and_delete(self, page) -> None:
@@ -226,10 +244,12 @@ class PlaywrightSession:
             or "job has expired on indeed" in body
             or "job expired on indeed" in body
         ):
-            await self.db.update_job(self.job_url, "invalid", "expired_on_indeed")
+            await self.db.update_job(self.job_url, "disqualified", "expired_on_indeed")
+            self._log_failure("page_validation", "expired_on_indeed", "navigate")
             raise SessionExit(12, "expired")
         if "not found" in body or "not found" in title or "404" in title or "404" in body:
-            await self.db.delete_job(self.job_url)
+            self._log_failure("page_validation", "not_found", "navigate")
+            await self.db.update_job(self.job_url, "failed_with_reason", "not_found")
             raise SessionExit(13, "deleted")
 
     async def _detect_non_remote_job(self, page) -> None:
@@ -250,12 +270,27 @@ class PlaywrightSession:
                     continue
                 if text:
                     location_candidates.append(text)
+        try:
+            body = (await page.inner_text("body")).lower()
+            title = (await page.title()).lower()
+        except Exception as exc:
+            self.logger.warning("Failed reading page text for disqualification: %s", exc)
+            body, title = "", ""
+        if "hybrid" in body or "hybrid" in title:
+            self._log_failure("disqualification", "hybrid_role", "navigate")
+            await self.db.update_job(self.job_url, "disqualified", "disqualified:hybrid_role")
+            raise SessionExit(14, "disqualified")
         for text in location_candidates:
             if "remote" in text.lower():
                 return
-        if location_candidates:
-            await self.db.update_job(self.job_url, "non_remote", f"non_remote:{location_candidates[0][:200]}")
-            raise SessionExit(14, "non_remote")
+        if location_candidates and "remote" not in body:
+            self._log_failure("disqualification", "non_remote_location", "navigate")
+            await self.db.update_job(
+                self.job_url,
+                "disqualified",
+                f"disqualified:non_remote_location:{location_candidates[0][:200]}",
+            )
+            raise SessionExit(14, "disqualified")
 
     async def _detect_already_applied(self, page) -> bool:
         try:
@@ -358,7 +393,9 @@ class PlaywrightSession:
             await self.db.update_job(self.job_url, "captcha_pending", "additional_verification")
             try:
                 await asyncio.wait_for(
-                    asyncio.to_thread(input, "Additional verification needed. Solve captcha then press ENTER\\n"),
+                    asyncio.to_thread(
+                        input, "CAPTCHA DETECTED — complete manually and press ENTER to continue\n"
+                    ),
                     timeout=self.config.captcha_wait_seconds,
                 )
             except asyncio.TimeoutError:
@@ -395,7 +432,7 @@ class PlaywrightSession:
             return True
         return await self._click_any(
             page,
-            ["Apply", "Apply now", "Apply on company site"],
+            ["Apply now", "Apply", "Continue", "Next", "Submit application", "Apply on company site"],
             timeout=15000,
             allow_links=True,
         )
@@ -411,14 +448,17 @@ class PlaywrightSession:
             try:
                 if await loc.count() == 0:
                     continue
-                await loc.first.scroll_into_view_if_needed()
                 self.last_action["label"] = "Apply"
-                self.last_action["fn"] = lambda l=loc.first: l.click(timeout=15000, force=True)
-                await loc.first.click(timeout=15000, force=True)
-                self.logger.info("Clicked apply CTA selector %s", selector)
-                return True
+                self.last_action["fn"] = lambda l=loc.first: self._safe_click(
+                    l, "Apply", timeout=15000, allow_force=True
+                )
+                if await self._safe_click(loc.first, "Apply", timeout=15000, allow_force=True):
+                    self.logger.info("Clicked apply CTA selector %s", selector)
+                    return True
             except Exception as exc:
-                self.logger.warning("Apply CTA click failed for %s: %s", selector, exc)
+                self.logger.warning(
+                    "Apply CTA click failed for %s at %s: %s", selector, page.url, exc, extra=self._log_ctx("apply")
+                )
         return False
 
     async def _click_any(self, page, labels, timeout: int, allow_links: bool = False) -> bool:
@@ -441,16 +481,23 @@ class PlaywrightSession:
                     if self.train_mode and "submit" in label.lower():
                         self.logger.info("Training mode: skipping submit click")
                         return False
-                    await loc.first.scroll_into_view_if_needed()
                     self.last_action["label"] = label
-                    self.last_action["fn"] = lambda l=loc.first, t=timeout: l.click(timeout=t, force=True)
+                    self.last_action["fn"] = lambda l=loc.first, t=timeout: self._safe_click(
+                        l, label, timeout=t, allow_force=True
+                    )
                     if "submit" in label.lower():
                         await page.wait_for_load_state("networkidle")
-                    await loc.first.click(timeout=timeout, force=True)
-                    self.logger.info("Clicked %s", label)
-                    return True
+                    if await self._safe_click(loc.first, label, timeout=timeout, allow_force=True):
+                        self.logger.info("Clicked %s", label, extra=self._log_ctx("click"))
+                        return True
                 except Exception as exc:
-                    self.logger.warning("Click failed on %s: %s", label, exc)
+                    self.logger.warning(
+                        "Click failed on %s at %s (action=click, reason=%s)",
+                        label,
+                        page.url,
+                        exc,
+                        extra=self._log_ctx("click"),
+                    )
         return False
 
     async def _detect_external_context(self, page, context) -> Optional[dict]:
@@ -476,13 +523,23 @@ class PlaywrightSession:
 
     async def _external_apply_handler(self, page, context, external_info: dict) -> None:
         active_page = external_info["page"]
+        ats_hint = await self._detect_ats(active_page.url, active_page)
+        await self.db.update_job(
+            self.job_url,
+            "external_pending",
+            self._format_external_reason(
+                active_page.url,
+                ats_hint,
+                external_info.get("reason", "external_detected"),
+            ),
+            is_external=True,
+        )
         if external_info.get("button"):
             label = external_info["button"]
             self.logger.info("External triggered by button: %s", label)
             button = active_page.locator(f"button:has-text('{label}')")
             try:
-                await button.first.scroll_into_view_if_needed()
-                await button.first.click(timeout=15000)
+                await self._safe_click(button.first, label, timeout=15000, allow_force=True)
             except Exception as exc:
                 self.logger.warning("External apply button click failed: %s", exc)
             try:
@@ -492,12 +549,6 @@ class PlaywrightSession:
         final_url = active_page.url
         ats = await self._detect_ats(final_url, active_page)
         self.ats = ats
-        await self.db.update_job(
-            self.job_url,
-            "external",
-            self._format_external_reason(final_url, ats, external_info.get("reason", "external_detected")),
-            is_external=True,
-        )
         for step in range(self.config.max_steps):
             self._record_checkpoint(f"external_step_{step + 1}")
             self.logger.info(
@@ -512,9 +563,11 @@ class PlaywrightSession:
 
             submit_result = await self._external_handle_submit(active_page)
             if submit_result == "confirmation_unavailable":
-                await self._external_fail("navigation_blocked", "confirmation_unavailable", active_page, final_url, ats)
+                await self._external_fail(
+                    "failed_with_reason", "confirmation_unavailable", active_page, final_url, ats
+                )
             if submit_result == "navigation_blocked":
-                await self._external_fail("navigation_blocked", "submit_blocked", active_page, final_url, ats)
+                await self._external_fail("failed_with_reason", "submit_blocked", active_page, final_url, ats)
             if submit_result == "skipped":
                 self.logger.info("Training mode: skipping external submit", extra=self._log_ctx("train_skip"))
                 continue
@@ -531,7 +584,7 @@ class PlaywrightSession:
                     raise SessionExit(0, "applied")
                 await self.db.update_job(
                     self.job_url,
-                    "external_submitted",
+                    "external_pending",
                     self._format_external_reason(active_page.url, ats, "submitted_no_confirmation"),
                     is_external=True,
                 )
@@ -542,12 +595,14 @@ class PlaywrightSession:
                 continue
 
             if await self._external_detect_required_errors(active_page):
-                await self._external_fail("missing_required_fields", "required_fields", active_page, final_url, ats)
+                await self._external_fail(
+                    "failed_with_reason", "required_fields", active_page, final_url, ats
+                )
 
             self.logger.info("External flow: no actionable button")
             await asyncio.sleep(2)
 
-        await self._external_fail("unsupported_external_flow", "max_steps", active_page, final_url, ats)
+        await self._external_fail("failed_with_reason", "max_steps", active_page, final_url, ats)
 
     async def _external_handle_submit(self, page) -> Optional[str]:
         for label in EXTERNAL_FINAL_SUBMIT_LABELS:
@@ -558,9 +613,9 @@ class PlaywrightSession:
                 if not await self._external_confirm_submit():
                     return "confirmation_unavailable"
                 try:
-                    await loc.first.scroll_into_view_if_needed()
-                    await loc.first.click(timeout=20000)
-                    return "submitted"
+                    if await self._safe_click(loc.first, label, timeout=20000, allow_force=True):
+                        return "submitted"
+                    return "navigation_blocked"
                 except Exception:
                     return "navigation_blocked"
         return None
@@ -584,10 +639,9 @@ class PlaywrightSession:
             loc = page.locator(f"button:has-text('{label}')")
             if await loc.count():
                 try:
-                    await loc.first.scroll_into_view_if_needed()
-                    await loc.first.click(timeout=15000)
-                    self.logger.info("External click %s", label)
-                    return True
+                    if await self._safe_click(loc.first, label, timeout=15000, allow_force=True):
+                        self.logger.info("External click %s", label)
+                        return True
                 except Exception as exc:
                     self.logger.warning("External click failed on %s: %s", label, exc)
         return False
@@ -602,6 +656,7 @@ class PlaywrightSession:
 
     async def _external_fail(self, status: str, reason: str, page, final_url: str, ats: str) -> None:
         await self._external_capture_screenshot(page, reason)
+        self._log_failure("external_flow", reason, "external")
         await self.db.update_job(
             self.job_url,
             status,
@@ -645,7 +700,11 @@ class PlaywrightSession:
         if url == self.progress.url and value == self.progress.value and now - self.progress.timestamp > threshold:
             self.logger.info("No progress detected, rescanning for actions")
             await self._detect_captcha(page, "stall_detected")
-            await self._click_any(page, ["Continue", "Review", "Submit", "Submit your application"], timeout=8000)
+            await self._click_any(
+                page,
+                ["Continue", "Next", "Review", "Submit", "Submit application", "Submit your application"],
+                timeout=8000,
+            )
             await self._update_progress_marker(page)
         elif url != self.progress.url or value != self.progress.value:
             await self._update_progress_marker(page)
@@ -708,3 +767,82 @@ class PlaywrightSession:
     def _record_checkpoint(self, label: str) -> None:
         if not self.checkpoints or self.checkpoints[-1] != label:
             self.checkpoints.append(label)
+
+    def _log_failure(self, action: str, reason: str, step: str) -> None:
+        self.logger.error(
+            "Failure at %s: action=%s reason=%s url=%s",
+            step,
+            action,
+            reason,
+            self.job_url,
+            extra=self._log_ctx(step),
+        )
+
+    async def _safe_click(self, locator, label: str, timeout: int, allow_force: bool) -> bool:
+        backoff = CLICK_RETRY_BASE_SECONDS
+        for attempt in range(1, 5):
+            try:
+                if not await locator.count():
+                    return False
+                target = locator
+                if await self._is_disabled(target):
+                    self.logger.info(
+                        "Skipping click on disabled element: %s", label, extra=self._log_ctx("click")
+                    )
+                    return False
+                try:
+                    await target.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    await target.click(timeout=timeout)
+                    await asyncio.sleep(0.8)
+                    return True
+                except Exception as exc:
+                    error_text = str(exc).lower()
+                    if "not visible" in error_text or "not in viewport" in error_text:
+                        self.logger.info(
+                            "Element not visible; retrying click on %s (attempt %s)",
+                            label,
+                            attempt,
+                            extra=self._log_ctx("click"),
+                        )
+                        if allow_force and not await self._is_disabled(target):
+                            await target.click(timeout=timeout, force=True)
+                            await asyncio.sleep(0.8)
+                            return True
+                        raise
+                    if allow_force and not await self._is_disabled(target):
+                        await target.click(timeout=timeout, force=True)
+                        await asyncio.sleep(0.8)
+                        return True
+                    raise
+            except Exception as exc:
+                self.logger.warning(
+                    "Click attempt failed on %s at %s (attempt=%s, reason=%s)",
+                    label,
+                    self.job_url,
+                    attempt,
+                    exc,
+                    extra=self._log_ctx("click"),
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, CLICK_RETRY_MAX_SECONDS)
+        return False
+
+    async def _is_disabled(self, locator) -> bool:
+        try:
+            if not await locator.is_enabled():
+                return True
+        except Exception:
+            pass
+        try:
+            disabled = await locator.get_attribute("disabled")
+            aria = await locator.get_attribute("aria-disabled")
+            if disabled is not None:
+                return True
+            if aria and aria.lower() in {"true", "disabled"}:
+                return True
+        except Exception:
+            pass
+        return False

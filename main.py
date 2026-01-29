@@ -86,7 +86,7 @@ async def run() -> int:
         return 12
     except Exception as exc:
         context_logger.error("Unhandled exception: %s", exc)
-        await db_client.update_job(args.job_url, "failed", f"unhandled_exception:{exc}")
+        await db_client.update_job(args.job_url, "failed_with_reason", f"unhandled_exception:{exc}")
         return 98
     return 0
 
