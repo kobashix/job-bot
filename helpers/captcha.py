@@ -101,7 +101,7 @@ class CaptchaHandler:
         self.logger.warning("Captcha detected: %s", prompt)
         try:
             await asyncio.wait_for(
-                async_input("Solve captcha in browser, then press ENTER to continue\n"),
+                async_input("CAPTCHA DETECTED — complete manually and press ENTER to continue\n"),
                 timeout=self.wait_seconds,
             )
         except asyncio.TimeoutError:

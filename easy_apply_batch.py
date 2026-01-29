@@ -13,18 +13,10 @@ from helpers.utils import ContextLogger, load_config, setup_logging
 
 RETRYABLE_STATUSES = (
     "applied",
-    "external",
-    "external_submitted",
-    "blocked",
-    "failed",
-    "invalid",
-    "no_apply",
-    "permanent_failed",
+    "external_pending",
+    "disqualified",
     "captcha_pending",
-    "non_remote",
-    "unsupported_external_flow",
-    "missing_required_fields",
-    "navigation_blocked",
+    "failed_with_reason",
 )
 
 
@@ -86,16 +78,19 @@ class BatchRunner:
     async def _mark_failure(self, url: str, returncode: int, output: str) -> None:
         lowered = output.lower() if output else ""
         if "external" in lowered:
-            await self.db.update_job(url, "external", "company_site")
+            await self.db.update_job(url, "external_pending", "company_site", is_external=True)
             return
         if "captcha" in lowered:
             await self.db.update_job(url, "captcha_pending", "captcha_pending")
             return
-        if "invalid" in lowered or "404" in lowered:
-            await self.db.update_job(url, "invalid", "invalid_job")
+        if "disqualified" in lowered or "expired" in lowered:
+            await self.db.update_job(url, "disqualified", "disqualified_batch")
             return
-        fallback_reason = output[-500:] if output else f"unclassified_failure_returncode_{returncode}"
-        await self.db.update_job(url, "failed", fallback_reason)
+        if "invalid" in lowered or "404" in lowered:
+            await self.db.update_job(url, "failed_with_reason", "invalid_job")
+            return
+        fallback_reason = output[-500:] if output else f"failed_returncode_{returncode}"
+        await self.db.update_job(url, "failed_with_reason", fallback_reason)
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
