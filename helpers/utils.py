@@ -98,11 +98,12 @@ def _load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text())
 
 
-def load_config(path: Path) -> AppConfig:
+def load_config(path: Path | str) -> AppConfig:
     """Load configuration from JSON and environment overrides."""
 
     load_dotenv()
-    data = _load_json(path)
+    config_path = Path(path)
+    data = _load_json(config_path)
     profile_data = data.get("profile", {})
     profile = UserProfile(
         full_name=os.getenv("APPLY_FULL_NAME", profile_data.get("full_name", "")),

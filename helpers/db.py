@@ -43,6 +43,34 @@ class DBClient:
             conn.execute(query, params)
             conn.commit()
 
+    async def fetch_jobs(self, limit: int, excluded_statuses: tuple[str, ...]) -> list[tuple[str]]:
+        """Fetch a batch of job URLs with retry handling."""
+
+        attempts = 0
+        query = """
+            SELECT job_url
+            FROM jobs
+            WHERE applied = 0
+              AND (status IS NULL OR status NOT IN ({placeholders}))
+            LIMIT ?
+        """.format(placeholders=", ".join("?" for _ in excluded_statuses))
+        params = (*excluded_statuses, limit)
+        while True:
+            attempts += 1
+            try:
+                async with self._lock:
+                    return await asyncio.to_thread(self._fetch_sync, query, params)
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc).lower() and attempts < 6:
+                    self.logger.warning("DB locked; retrying fetch", extra={"attempts": attempts})
+                    await asyncio.sleep(1 + attempts)
+                    continue
+                raise
+
+    def _fetch_sync(self, query: str, params: tuple) -> list[tuple[str]]:
+        with sqlite3.connect(self.db_path, timeout=30) as conn:
+            return conn.execute(query, params).fetchall()
+
     async def update_job(
         self,
         job_url: str,
