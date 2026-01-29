@@ -238,11 +238,23 @@ class PlaywrightSession:
             raise SessionExit(14, "non_remote")
 
     async def _detect_already_applied(self, page) -> bool:
+        try:
+            applied_button = page.get_by_role("button", name="Applied")
+            if await applied_button.count() and await applied_button.first.is_visible():
+                await self.db.update_job(self.job_url, "applied", "already_applied")
+                self.logger.info("Already applied badge detected", extra=self._log_ctx("already_applied"))
+                return True
+        except Exception:
+            pass
+
         applied_locators = [
             "button:has-text('Applied')",
-            "text=/\\bApplied\\b/",
+            "span:has-text('Applied')",
+            "div:has-text('Applied')",
             "[data-testid*='applied' i]",
-            "[aria-label*='Applied' i]",
+            "[aria-label*='applied' i]",
+            "[aria-pressed='true']:has-text('Applied')",
+            "text=/\\bApplied\\b/i",
         ]
         for selector in applied_locators:
             locator = page.locator(selector)
@@ -253,6 +265,15 @@ class PlaywrightSession:
                     return True
             except Exception:
                 continue
+
+        try:
+            body = (await page.inner_text("body")).lower()
+        except Exception:
+            body = ""
+        if "applied" in body and "apply" in body:
+            await self.db.update_job(self.job_url, "applied", "already_applied_text")
+            self.logger.info("Already applied text detected", extra=self._log_ctx("already_applied"))
+            return True
         return False
 
     async def _handle_additional_verification(self, page) -> None:
