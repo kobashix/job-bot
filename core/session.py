@@ -15,6 +15,7 @@ from helpers.form_fill import FormFiller
 
 SUCCESS_TEXTS = [
     "application has been submitted",
+    "your application has been submitted",
     "thank you for applying",
     "application submitted",
     "thank you",
@@ -373,13 +374,30 @@ class PlaywrightSession:
             self.logger.warning("Retry action failed: %s", exc)
 
     async def _find_apply_button(self, page) -> bool:
-        return await self._click_any(page, ["Apply", "Apply now", "Apply on company site"], timeout=15000)
+        return await self._click_any(
+            page,
+            ["Apply", "Apply now", "Apply on company site"],
+            timeout=15000,
+            allow_links=True,
+        )
 
-    async def _click_any(self, page, labels, timeout: int) -> bool:
+    async def _click_any(self, page, labels, timeout: int, allow_links: bool = False) -> bool:
         for label in labels:
-            loc = page.locator(f"button:has-text('{label}')")
-            if await loc.count():
+            locators = [page.locator(f"button:has-text('{label}')")]
+            try:
+                locators.insert(0, page.get_by_role("button", name=label))
+            except Exception:
+                pass
+            if allow_links:
                 try:
+                    locators.append(page.get_by_role("link", name=label))
+                except Exception:
+                    pass
+                locators.append(page.locator(f"a:has-text('{label}')"))
+            for loc in locators:
+                try:
+                    if await loc.count() == 0:
+                        continue
                     if self.train_mode and "submit" in label.lower():
                         self.logger.info("Training mode: skipping submit click")
                         return False
@@ -457,6 +475,9 @@ class PlaywrightSession:
                 await self._external_fail("navigation_blocked", "confirmation_unavailable", active_page, final_url, ats)
             if submit_result == "navigation_blocked":
                 await self._external_fail("navigation_blocked", "submit_blocked", active_page, final_url, ats)
+            if submit_result == "skipped":
+                self.logger.info("Training mode: skipping external submit", extra=self._log_ctx("train_skip"))
+                continue
             if submit_result == "submitted":
                 await active_page.wait_for_load_state("networkidle")
                 if await self._is_success_page(active_page):
@@ -492,6 +513,8 @@ class PlaywrightSession:
         for label in EXTERNAL_FINAL_SUBMIT_LABELS:
             loc = page.locator(f"button:has-text('{label}')")
             if await loc.count():
+                if self.train_mode:
+                    return "skipped"
                 if not await self._external_confirm_submit():
                     return "confirmation_unavailable"
                 try:
@@ -622,7 +645,9 @@ class PlaywrightSession:
             body, title = "", ""
         if any(text in body or text in title for text in SUCCESS_TEXTS):
             return True
-        locator = page.locator("text=/application has been submitted|application submitted|thank you for applying/i")
+        locator = page.locator(
+            "text=/application has been submitted|your application has been submitted|application submitted|thank you for applying/i"
+        )
         try:
             if await locator.count() and await locator.first.is_visible():
                 return True
