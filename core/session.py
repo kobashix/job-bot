@@ -119,6 +119,8 @@ class PlaywrightSession:
         await self._detect_not_found_and_delete(page)
         await self._handle_additional_verification(page)
         await self._detect_non_remote_job(page)
+        if await self._detect_already_applied(page):
+            raise SessionExit(0, "already_applied")
         await self._detect_captcha(page, "landing")
 
     async def _handle_landing(self, page, context) -> None:
@@ -139,6 +141,8 @@ class PlaywrightSession:
             await self._detect_not_found_and_delete(page)
             await self._handle_additional_verification(page)
             await self._detect_non_remote_job(page)
+            if await self._detect_already_applied(page):
+                raise SessionExit(0, "already_applied")
             await self._detect_captcha(page, f"step_{step + 1}")
             external_info = await self._detect_external_context(page, context)
             if external_info:
@@ -232,6 +236,24 @@ class PlaywrightSession:
         if location_candidates:
             await self.db.update_job(self.job_url, "non_remote", f"non_remote:{location_candidates[0][:200]}")
             raise SessionExit(14, "non_remote")
+
+    async def _detect_already_applied(self, page) -> bool:
+        applied_locators = [
+            "button:has-text('Applied')",
+            "text=/\\bApplied\\b/",
+            "[data-testid*='applied' i]",
+            "[aria-label*='Applied' i]",
+        ]
+        for selector in applied_locators:
+            locator = page.locator(selector)
+            try:
+                if await locator.count() and await locator.first.is_visible():
+                    await self.db.update_job(self.job_url, "applied", "already_applied")
+                    self.logger.info("Already applied badge detected", extra=self._log_ctx("already_applied"))
+                    return True
+            except Exception:
+                continue
+        return False
 
     async def _handle_additional_verification(self, page) -> None:
         try:
