@@ -27,15 +27,27 @@
      $env:APPLY_FULL_NAME = "Your Name"
      ```
 
-5. **Start Chrome/Edge with remote debugging**
-   - **Chrome:**
+5. **Start Edge or Chrome with remote debugging (separate profile)**
+   PowerShell needs the call operator (`&`) when launching an executable with arguments.
+
+   - **Edge (recommended):**
      ```powershell
-     "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9223 --user-data-dir="C:\temp\job-bot-profile"
+     & "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" `
+       --remote-debugging-port=9223 `
+       --user-data-dir="C:\temp\job-bot-edge-profile"
      ```
-   - **Edge:**
+
+   - **Chrome (separate profile, not your normal Chrome):**
      ```powershell
-     "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9223 --user-data-dir="C:\temp\job-bot-profile"
+     & "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+       --remote-debugging-port=9223 `
+       --user-data-dir="C:\temp\job-bot-chrome-profile"
      ```
+
+   > If you prefer, you can also use `Start-Process`:
+   > ```powershell
+   > Start-Process -FilePath "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" -ArgumentList "--remote-debugging-port=9223 --user-data-dir=C:\temp\job-bot-edge-profile"
+   > ```
 
 6. **Run a single job apply**
    ```powershell
