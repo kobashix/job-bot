@@ -1,1 +1,1 @@
-# job-bot
+# job-bot 2.0
