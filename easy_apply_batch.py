@@ -1,10 +1,16 @@
-import subprocess
-import sqlite3
-import time
-import sys
+"""Batch runner for easy apply using the async single-apply entry point."""
+from __future__ import annotations
 
-DB_PATH = "jobs.db"
-PYTHON = sys.executable
+import argparse
+import asyncio
+import sys
+from dataclasses import dataclass
+from typing import Iterable
+
+from helpers.db import DBClient
+from helpers.utils import ContextLogger, load_config, setup_logging
+
+
 RETRYABLE_STATUSES = (
     "applied",
     "external",
@@ -21,103 +27,98 @@ RETRYABLE_STATUSES = (
     "navigation_blocked",
 )
 
-def fetch_jobs(limit):
-    attempts = 0
-    while True:
-        try:
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
-                return conn.execute(
-                    """
-                    SELECT job_url
-                    FROM jobs
-                    WHERE applied = 0
-                      AND (status IS NULL OR status NOT IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?))
-                    LIMIT ?
-                    """,
-                    (*RETRYABLE_STATUSES, limit),
-                ).fetchall()
-        except sqlite3.OperationalError as exc:
-            attempts += 1
-            print(f"[DB] Fetch failed ({attempts}): {exc}")
-            if "locked" in str(exc).lower() and attempts < 6:
-                time.sleep(2 + attempts)
-                continue
-            raise
 
-def mark(job_url, status, reason=None):
-    attempts = 0
-    while True:
-        try:
-            with sqlite3.connect(DB_PATH, timeout=30) as conn:
-                conn.execute(
-                    """
-                    UPDATE jobs
-                    SET status = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE job_url = ?
-                    """,
-                    (status, reason, job_url),
-                )
-                conn.commit()
-            return
-        except sqlite3.OperationalError as exc:
-            attempts += 1
-            print(f"[DB] Update failed ({attempts}): {exc}")
-            if "locked" in str(exc).lower() and attempts < 6:
-                time.sleep(2 + attempts)
-                continue
-            raise
+@dataclass
+class BatchResult:
+    success: int = 0
+    failed: int = 0
 
-def run_and_stream(cmd):
-    output = []
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
-        for line in proc.stdout:
-            print(line, end="")
-            output.append(line)
-        return proc.wait(), "".join(output)
 
-def main(limit=10):
-    jobs = fetch_jobs(limit)
-    log = print
+class BatchRunner:
+    """Runs easy_apply_single.py for a batch of jobs."""
 
-    log(f"Starting batch apply: {len(jobs)} jobs")
+    def __init__(self, db: DBClient, logger, python_exe: str) -> None:
+        self.db = db
+        self.logger = logger
+        self.python_exe = python_exe
 
-    success = 0
-    fail = 0
+    async def run(self, limit: int) -> BatchResult:
+        jobs = await self.db.fetch_jobs(limit, RETRYABLE_STATUSES)
+        self.logger.info("Starting batch apply: %s jobs", len(jobs))
+        result = BatchResult()
 
-    for idx, (url,) in enumerate(jobs, 1):
-        log(f"\n[{idx}/{len(jobs)}] Applying to:\n{url}\n")
-
-        returncode, output = run_and_stream([PYTHON, "easy_apply_single.py", url])
-
-        if returncode == 0:
-            success += 1
-        else:
-            fail += 1
-            if "external" in output.lower():
-                mark(url, "external", "company_site")
-            elif "captcha" in output.lower():
-                mark(url, "captcha_pending", "captcha_pending")
-            elif "invalid" in output.lower() or "404" in output.lower():
-                mark(url, "invalid", "invalid_job")
+        for idx, (url,) in enumerate(jobs, 1):
+            self.logger.info("[%s/%s] Applying to: %s", idx, len(jobs), url)
+            returncode, output = await self._run_single(url)
+            if returncode == 0:
+                result.success += 1
             else:
-                fallback_reason = output[-500:] if output else f"unclassified_failure_returncode_{returncode}"
-                mark(url, "failed", fallback_reason)
+                result.failed += 1
+                await self._mark_failure(url, returncode, output)
+            await asyncio.sleep(3)
 
-        time.sleep(8)
+        self.logger.info("Batch complete")
+        self.logger.info("Successes: %s", result.success)
+        self.logger.info("Failures: %s", result.failed)
+        if result.success == 0 and result.failed == 0:
+            self.logger.warning(
+                "No jobs processed. Check filters, job status, or database contents."
+            )
+        return result
 
-    log("\nBatch complete")
-    log(f"Successes: {success}")
-    log(f"Failures: {fail}")
-    if success == 0 and fail == 0:
-        log("[ERROR] No jobs processed. Check filters, job status, or database contents.")
+    async def _run_single(self, url: str) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            self.python_exe,
+            "easy_apply_single.py",
+            url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        output_lines: list[str] = []
+        assert proc.stdout is not None
+        async for line in proc.stdout:
+            decoded = line.decode(errors="ignore")
+            print(decoded, end="")
+            output_lines.append(decoded)
+        returncode = await proc.wait()
+        return returncode, "".join(output_lines)
+
+    async def _mark_failure(self, url: str, returncode: int, output: str) -> None:
+        lowered = output.lower() if output else ""
+        if "external" in lowered:
+            await self.db.update_job(url, "external", "company_site")
+            return
+        if "captcha" in lowered:
+            await self.db.update_job(url, "captcha_pending", "captcha_pending")
+            return
+        if "invalid" in lowered or "404" in lowered:
+            await self.db.update_job(url, "invalid", "invalid_job")
+            return
+        fallback_reason = output[-500:] if output else f"unclassified_failure_returncode_{returncode}"
+        await self.db.update_job(url, "failed", fallback_reason)
+
+
+def parse_args(argv: Iterable[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Batch runner for easy apply")
+    parser.add_argument("--limit", type=int, default=10, help="Max jobs to process")
+    parser.add_argument("--config", default="config.json", help="Path to config JSON")
+    return parser.parse_args(list(argv))
+
+
+async def run() -> int:
+    args = parse_args(sys.argv[1:])
+    config = load_config(args.config)
+    logger = setup_logging()
+    context_logger = ContextLogger(logger, {"job_url": "batch", "ats": "batch", "step": "batch"})
+    db_client = DBClient(str(config.db_path), context_logger)
+    runner = BatchRunner(db_client, context_logger, sys.executable)
+    await runner.run(args.limit)
+    return 0
+
+
+def main() -> None:
+    sys.exit(asyncio.run(run()))
+
 
 if __name__ == "__main__":
-    limit = 10
-    if "--limit" in sys.argv:
-        limit = int(sys.argv[sys.argv.index("--limit") + 1])
-    else:
-        for arg in sys.argv[1:]:
-            if arg.startswith("--limit="):
-                limit = int(arg.split("=", 1)[1])
-                break
-    main(limit)
+    main()
