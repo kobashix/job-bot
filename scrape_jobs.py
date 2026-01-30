@@ -153,10 +153,14 @@ def is_non_remote_text(text):
 
 def page_contains_expired(page):
     try:
-        content = page.content().lower()
+        expired_locator = page.locator("text=This job has expired")
+        if expired_locator.count():
+            if expired_locator.first.is_visible():
+                return True
+        body_text = page.inner_text("body").lower()
     except Exception:
         return False
-    return "this job has expired" in content
+    return "this job has expired" in body_text
 
 
 def extract_company(card):
