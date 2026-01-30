@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import sqlite3
 import sys
 from dataclasses import dataclass
 from typing import Iterable, Optional
