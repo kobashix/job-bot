@@ -13,11 +13,16 @@ if (!(Get-Command python -ErrorAction SilentlyContinue)) {
 # 2. Check and Create Virtual Environment
 $recreate = $false
 if (Test-Path .venv) {
-    # Check if the venv is broken (common if moved from another path)
+    # Stronger check: get the sys.executable path from inside the venv
+    $venvPython = ".\.venv\Scripts\python.exe"
     try {
-        & .venv\Scripts\python.exe --version | Out-Null
+        $realPath = & $venvPython -c "import sys; print(sys.executable)" 2>$null
+        if ($realPath -notlike "*$PWD*") {
+            Write-Warning "Virtual environment path mismatch ($realPath). Recreating..."
+            $recreate = $true
+        }
     } catch {
-        Write-Warning "Virtual environment appears broken. Recreating..."
+        Write-Warning "Virtual environment is broken. Recreating..."
         $recreate = $true
     }
 } else {
@@ -25,7 +30,10 @@ if (Test-Path .venv) {
 }
 
 if ($recreate) {
-    if (Test-Path .venv) { Remove-Item .venv -Recurse -Force }
+    if (Test-Path .venv) { 
+        Write-Host "Removing old .venv..." -ForegroundColor Gray
+        Remove-Item .venv -Recurse -Force -ErrorAction SilentlyContinue
+    }
     Write-Host "[1/4] Creating virtual environment..." -ForegroundColor Yellow
     python -m venv .venv
 } else {
@@ -34,16 +42,16 @@ if ($recreate) {
 
 # 3. Install Requirements
 Write-Host "[2/4] Installing dependencies..." -ForegroundColor Yellow
-& .venv\Scripts\pip.exe install -r requirements.txt
+& .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 
 # 4. Install Playwright Browsers
 Write-Host "[3/4] Installing Playwright browsers..." -ForegroundColor Yellow
-& .venv\Scripts\playwright.exe install chromium
+& .\.venv\Scripts\python.exe -m playwright install chromium
 
 # 5. Initialize Database
 if (!(Test-Path jobs.db)) {
     Write-Host "[4/4] Initializing database..." -ForegroundColor Yellow
-    & .venv\Scripts\python.exe init_db.py
+    & .\.venv\Scripts\python.exe init_db.py
 } else {
     Write-Host "[4/4] Database already exists." -ForegroundColor Green
 }
