@@ -19,6 +19,22 @@ SUCCESS_TEXTS = [
     "thank you for applying",
     "application submitted",
     "thank you",
+    "has been sent to",
+    "successfully submitted",
+]
+
+EXPIRED_TEXTS = [
+    "this job has expired",
+    "job has expired",
+    "job is no longer available",
+    "this job is no longer available",
+    "employer is not accepting applications",
+    "is not actively hiring",
+    "is reviewing applications",
+    "we can't find this page",
+    "we can’t find this page",
+    "404",
+    "page not found",
 ]
 
 BLOCK_TEXTS = [
@@ -101,7 +117,7 @@ class PlaywrightSession:
         self.form_filler = form_filler
         self.logger = logger
         self.progress = ProgressMarker()
-        self.last_action = {"label": None, "fn": None}
+        self.last_action: dict[str, any] = {"label": None, "fn": None}
         self.ats = "indeed"
         self.checkpoints: list[str] = []
 
@@ -126,7 +142,6 @@ class PlaywrightSession:
             raise NavigationTimeout(str(exc))
         await page.wait_for_load_state("networkidle")
         await self._detect_invalid(page, response)
-        await self._detect_not_found_and_delete(page)
         await self._update_job_metadata(page)
         await self._handle_additional_verification(page)
         await self._detect_non_remote_job(page)
@@ -165,7 +180,6 @@ class PlaywrightSession:
             self.logger.info("Step %s", step + 1, extra=self._log_ctx(f"step_{step + 1}"))
             await page.wait_for_load_state("networkidle")
             await self._detect_invalid(page, None)
-            await self._detect_not_found_and_delete(page)
             await self._update_job_metadata(page)
             await self._handle_additional_verification(page)
             await self._detect_non_remote_job(page)
@@ -212,6 +226,7 @@ class PlaywrightSession:
         raise SessionExit(99, "max_steps")
 
     async def _detect_invalid(self, page, response) -> None:
+        """Check if the page is expired, not found, or otherwise invalid."""
         status = response.status if response is not None else None
         if status and status >= 400:
             if status in {404, 410}:
@@ -221,51 +236,26 @@ class PlaywrightSession:
             self._log_failure("load_page", f"http_status_{status}", "navigate")
             await self.db.update_job(self.job_url, f"ERROR_http_status_{status}", f"http_status_{status}")
             raise InvalidJobPage(f"http_status_{status}")
+
         try:
             body = (await page.inner_text("body")).lower()
             title = (await page.title()).lower()
         except Exception as exc:
             self.logger.warning("Failed reading page text: %s", exc)
             return
-        invalid_texts = [
-            "job expired",
-            "job is no longer available",
-            "job has expired",
-            "this job is no longer available",
-            "this job has expired",
-            "we can't find this page",
-            "we can’t find this page",
-            "404",
-            "page not found",
-            "not found",
-        ]
-        for text in invalid_texts:
+
+        # Check for expired/invalid phrases
+        for text in EXPIRED_TEXTS:
             if text in body or text in title:
-                status = "EXPIRED" if ("expired" in text or "find this page" in text or "404" in text) else "ERROR_invalid_page"
                 self._log_failure("page_validation", f"invalid_text:{text}", "navigate")
-                await self.db.update_job(self.job_url, status, f"invalid_text:{text}")
+                await self.db.update_job(self.job_url, "EXPIRED", f"invalid_text:{text}")
                 raise InvalidJobPage(text)
 
-    async def _detect_not_found_and_delete(self, page) -> None:
-        try:
-            body = (await page.inner_text("body")).lower()
-            title = (await page.title()).lower()
-        except Exception as exc:
-            self.logger.warning("Failed reading page text: %s", exc)
-            return
-        if (
-            "this job has expired on indeed" in body
-            or "this job has expired on indeed" in title
-            or "job has expired on indeed" in body
-            or "job expired on indeed" in body
-        ):
+        # Indeed-specific expired banners
+        if "this job has expired on indeed" in body or "job has expired on indeed" in body:
             await self.db.update_job(self.job_url, "EXPIRED", "expired_on_indeed")
             self._log_failure("page_validation", "expired_on_indeed", "navigate")
             raise SessionExit(12, "expired")
-        if "not found" in body or "not found" in title or "404" in title or "404" in body:
-            self._log_failure("page_validation", "not_found", "navigate")
-            await self.db.update_job(self.job_url, "EXPIRED", "not_found")
-            raise SessionExit(13, "deleted")
 
     async def _detect_non_remote_job(self, page) -> None:
         selectors = [
@@ -323,51 +313,40 @@ class PlaywrightSession:
             raise SessionExit(14, "disqualified")
 
     async def _detect_already_applied(self, page) -> bool:
+        """Check if the internal or external page indicates the user has already applied."""
         try:
-            await page.wait_for_selector(
-                "button[aria-label='Applied'], span:has-text('Applied'), div:has-text('Applied')",
-                timeout=3000,
-                state="visible",
-            )
-        except Exception:
-            pass
-        try:
-            applied_button = page.get_by_role("button", name="Applied")
-            if await applied_button.count() and await applied_button.first.is_visible():
-                await self.db.update_job(self.job_url, "APPLIED", "already_applied")
-                self.logger.info("Already applied badge detected", extra=self._log_ctx("already_applied"))
-                return True
-        except Exception:
-            pass
-
-        applied_locators = [
-            "button[aria-label='Applied']",
-            "button:has-text('Applied')",
-            "span:has-text('Applied')",
-            "div:has-text('Applied')",
-            "[data-testid*='applied' i]",
-            "[aria-label*='applied' i]",
-            "[aria-pressed='true']:has-text('Applied')",
-            "text=/\\bApplied\\b/i",
-        ]
-        for selector in applied_locators:
-            locator = page.locator(selector)
-            try:
+            # Check for common "Applied" badge selectors
+            applied_locators = [
+                "button[aria-label='Applied']",
+                "button:has-text('Applied')",
+                "span:has-text('Applied')",
+                "div:has-text('Applied')",
+                "button[aria-disabled='true']:has-text('Applied')",
+                "[data-testid*='applied' i]",
+                "[aria-label*='applied' i]",
+                "text=/\\bApplied\\b/i",
+                "text=/\\bYou applied\\b/i",
+                "text=/\\bApplication submitted\\b/i",
+            ]
+            for selector in applied_locators:
+                locator = page.locator(selector)
                 if await locator.count() and await locator.first.is_visible():
-                    await self.db.update_job(self.job_url, "APPLIED", "already_applied")
-                    self.logger.info("Already applied badge detected", extra=self._log_ctx("already_applied"))
+                    self.logger.info("Already applied badge detected via: %s", selector, extra=self._log_ctx("already_applied"))
+                    await self.db.update_job(self.job_url, "APPLIED", "already_applied_badge")
+                    # Explicitly log to console for PowerShell visibility
+                    print(f"[APPLIED] {self.job_url}", flush=True)
                     return True
-            except Exception:
-                continue
 
-        try:
+            # Text-based fallback in body
             body = (await page.inner_text("body")).lower()
-        except Exception:
-            body = ""
-        if "applied" in body and "apply" in body:
-            await self.db.update_job(self.job_url, "APPLIED", "already_applied_text")
-            self.logger.info("Already applied text detected", extra=self._log_ctx("already_applied"))
-            return True
+            applied_phrases = ["you applied", "application submitted", "already applied"]
+            if any(p in body for p in applied_phrases):
+                self.logger.info("Already applied text detected in page body", extra=self._log_ctx("already_applied"))
+                await self.db.update_job(self.job_url, "APPLIED", "already_applied_text")
+                print(f"[APPLIED] {self.job_url}", flush=True)
+                return True
+        except Exception as exc:
+            self.logger.warning("Already applied detection failed: %s", exc)
         return False
 
     async def _update_job_metadata(self, page) -> None:
@@ -443,31 +422,30 @@ class PlaywrightSession:
             await self._retry_last_action()
 
     async def _detect_apply_cta(self, page) -> Optional[str]:
-        external_labels = ["Apply on company site"]
-        easy_apply_labels = ["Apply now"]
+        """Detect and click the initial Apply button (Easy Apply or External)."""
+        # 1. External Apply (Indeed page shows "Apply on company site")
+        external_labels = ["Apply on company site", "Apply externally", "Apply on employer site"]
         for label in external_labels:
             for locator in self._text_first_locators(page, label, allow_links=True):
                 try:
-                    if await locator.count():
-                        await locator.first.scroll_into_view_if_needed()
-                        if await locator.first.is_visible():
-                            self.logger.info("External apply CTA detected: %s", label)
-                            return "external"
+                    if await locator.count() and await locator.first.is_visible():
+                        self.logger.info("External apply CTA detected: %s", label)
+                        return "external"
                 except Exception:
                     continue
+
+        # 2. Indeed Easy Apply ("Apply now")
+        easy_apply_labels = ["Apply now", "Apply", "Easily apply"]
         for label in easy_apply_labels:
             for locator in self._text_first_locators(page, label, allow_links=True):
                 try:
-                    if await locator.count():
-                        self.last_action["label"] = label
-                        self.last_action["fn"] = lambda l=locator.first: self._safe_click(
-                            l, label, timeout=30000, allow_force=True
-                        )
+                    if await locator.count() and await locator.first.is_visible():
+                        self.logger.info("Easy Apply CTA detected: %s", label)
+                        # We click it here to start the Indeed flow
                         if await self._safe_click(locator.first, label, timeout=30000, allow_force=True):
-                            self.logger.info("Clicked %s", label, extra=self._log_ctx("apply"))
                             return "easy_apply"
-                except Exception as exc:
-                    self.logger.warning("Apply CTA click failed for %s: %s", label, exc)
+                except Exception:
+                    continue
         return None
 
     def _text_first_locators(self, page, label: str, allow_links: bool = False) -> list:
@@ -601,6 +579,8 @@ class PlaywrightSession:
             ),
             is_external=True,
         )
+        # Log to PowerShell
+        print(f"[EXTERNAL] {self.job_url} -> {active_page.url}", flush=True)
         if external_info.get("button"):
             label = external_info["button"]
             self.logger.info("External triggered by button: %s", label)

@@ -29,7 +29,7 @@ class DBClient:
             attempts += 1
             try:
                 async with self._lock:
-                    await asyncio.to_thread(self._execute_sync, query, params)
+                    await asyncio.to_thread(lambda: self._execute_sync(query, params))
                 return DBResult(True, attempts)
             except sqlite3.OperationalError as exc:
                 if "locked" in str(exc).lower() and attempts < 6:
@@ -37,6 +37,8 @@ class DBClient:
                     await asyncio.sleep(1 + attempts)
                     continue
                 raise
+        # Fallback for static analysis
+        return DBResult(False, attempts)
 
     def _execute_sync(self, query: str, params: tuple) -> None:
         with sqlite3.connect(self.db_path, timeout=30) as conn:
@@ -62,13 +64,15 @@ class DBClient:
             attempts += 1
             try:
                 async with self._lock:
-                    return await asyncio.to_thread(self._fetch_sync, query, params)
+                    return await asyncio.to_thread(lambda: self._fetch_sync(query, params))
             except sqlite3.OperationalError as exc:
                 if "locked" in str(exc).lower() and attempts < 6:
                     self.logger.warning("DB locked; retrying fetch", extra={"attempts": attempts})
                     await asyncio.sleep(1 + attempts)
                     continue
                 raise
+        # Fallback for static analysis
+        return []
 
     def _fetch_sync(self, query: str, params: tuple) -> list[tuple[str]]:
         with sqlite3.connect(self.db_path, timeout=30) as conn:
@@ -89,7 +93,9 @@ class DBClient:
             "last_error = ?",
             "updated_at = CURRENT_TIMESTAMP",
         ]
-        values = [1 if status in {"applied", "APPLIED"} else 0, status, reason]
+        # Standardize terminal status to uppercase
+        status_upper = status.upper()
+        values = [1 if status_upper == "APPLIED" else 0, status_upper, reason]
         if is_external is not None:
             fields.append("is_external = ?")
             values.append(1 if is_external else 0)
@@ -123,6 +129,51 @@ class DBClient:
         values.append(job_url)
         query = f"UPDATE jobs SET {', '.join(fields)} WHERE job_url = ?"
         return await self._execute(query, tuple(values))
+
+    async def log_event(self, job_url: str, level: str, message: str, reason: Optional[str] = None) -> DBResult:
+        """Log an event for a specific job."""
+        # For now, we'll use the existing last_error/status as a simple 'event' log in the jobs table
+        # but we can expand this to a separate table if requested. 
+        # For YOLO redo, keeping it simple in the jobs table is preferred for 'making it work properly'.
+        return await self.update_job(job_url, status=level, reason=f"{message}: {reason}" if reason else message)
+
+    async def upsert_job(
+        self,
+        job_url: str,
+        title: Optional[str] = None,
+        company: Optional[str] = None,
+        location: Optional[str] = None,
+        is_external: bool = False,
+    ) -> DBResult:
+        """Insert or update a job record."""
+        # Use job_url as the key
+        now = "CURRENT_TIMESTAMP"
+        
+        # Check if exists
+        check_query = "SELECT job_url FROM jobs WHERE job_url = ?"
+        existing = await asyncio.to_thread(lambda: self._fetch_sync(check_query, (job_url,)))
+        
+        if existing:
+            fields = ["updated_at = " + now]
+            values = []
+            if title:
+                fields.append("title = ?")
+                values.append(title)
+            if company:
+                fields.append("company = ?")
+                values.append(company)
+            if location:
+                fields.append("location = ?")
+                values.append(location)
+            values.append(job_url)
+            query = f"UPDATE jobs SET {', '.join(fields)} WHERE job_url = ?"
+            return await self._execute(query, tuple(values))
+        else:
+            query = """
+                INSERT INTO jobs (job_url, title, company, location, is_external, status, applied, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'NEW', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """
+            return await self._execute(query, (job_url, title, company, location, 1 if is_external else 0))
 
     async def delete_job(self, job_url: str) -> DBResult:
         """Delete job from the database."""

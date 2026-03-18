@@ -1,62 +1,48 @@
-# job-bot 2.0
+# Job Bot 2.0
 
-## Windows 11 (PowerShell) setup and run
+A high-performance, asynchronous job application bot for Indeed and external ATS platforms.
 
-1. **Install Python 3.10+**
-   - Download and install from https://www.python.org/downloads/windows/
-   - During install, check **“Add Python to PATH.”**
+## Core Features
+- **Unified Async Architecture**: Built on Playwright and `asyncio` for speed and reliability.
+- **Intelligent Form Filling**: Learns from previous answers and handles complex EEO/commute questions.
+- **Robust Detection**: Advanced logic for detecting "Applied", "Expired", and "Non-Remote" jobs.
+- **CAPTCHA Handling**: Integrated support for resolving challenges.
 
-2. **Create and activate a virtual environment**
-   ```powershell
-   python -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   ```
+## Getting Started
 
-3. **Install dependencies**
-   ```powershell
-   pip install playwright python-dotenv
-   python -m playwright install chromium
-   ```
+### 1. Setup
+- Install dependencies: `pip install -r requirements.txt`
+- Install Playwright browsers: `playwright install chromium`
+- Launch a browser with CDP enabled (default: `localhost:9223`).
 
-4. **Configure your profile**
-   - Edit `config.json` and fill in your profile values (name, email, phone, etc.).
-   - Optionally, set environment overrides in PowerShell:
-     ```powershell
-     $env:APPLY_EMAIL = "you@example.com"
-     $env:APPLY_PHONE = "555-555-5555"
-     $env:APPLY_FULL_NAME = "Your Name"
-     ```
+### 2. Usage
 
-5. **Start Edge or Chrome with remote debugging (separate profile)**
-   PowerShell needs the call operator (`&`) when launching an executable with arguments.
+#### Scrape Jobs
+Scrape remote jobs from Indeed and save them to the database:
+```bash
+python scrape_jobs.py "https://www.indeed.com/jobs?q=software+engineer&l=remote"
+```
 
-   - **Edge (recommended):**
-     ```powershell
-     & "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" `
-       --remote-debugging-port=9223 `
-       --user-data-dir="C:\temp\job-bot-edge-profile"
-     ```
+#### Apply to Jobs
+Apply to a single job URL:
+```bash
+python unified_apply.py "https://www.indeed.com/viewjob?jk=..."
+```
 
-   - **Chrome (separate profile, not your normal Chrome):**
-     ```powershell
-     & "C:\Program Files\Google\Chrome\Application\chrome.exe" `
-       --remote-debugging-port=9223 `
-       --user-data-dir="C:\temp\job-bot-chrome-profile"
-     ```
+Run in **batch mode** (processes the next 10 jobs in the database):
+```bash
+python unified_apply.py
+```
 
-   > If you prefer, you can also use `Start-Process`:
-   > ```powershell
-   > Start-Process -FilePath "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" -ArgumentList "--remote-debugging-port=9223 --user-data-dir=C:\temp\job-bot-edge-profile"
-   > ```
+#### Training Mode
+Run in training mode to learn new form answers:
+```bash
+python unified_apply.py --train "JOB_URL"
+```
 
-6. **Run a single job apply**
-   ```powershell
-   python .\easy_apply_single.py "https://www.indeed.com/viewjob?jk=YOUR_JOB_ID"
-   ```
+## Configuration
+Update `config.json` with your profile details and preferences.
 
-7. **Training mode (optional)**
-   ```powershell
-   python .\easy_apply_single.py --train "https://www.indeed.com/viewjob?jk=YOUR_JOB_ID"
-   ```
-
-> **Tip:** If you change the remote debugging port or profile directory, update `config.json` accordingly.
+## Advanced
+- **APPLY_LIMIT**: Environment variable to set the number of jobs to process in batch mode (default: 10).
+- **Database**: All job statuses and application history are stored in `jobs.db`.
