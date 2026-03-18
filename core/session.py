@@ -125,8 +125,19 @@ class PlaywrightSession:
         """Run the main application flow."""
 
         async with async_playwright() as playwright:
-            self.logger.info("Connecting to Chromium", extra=self._log_ctx("init"))
-            browser = await playwright.chromium.connect_over_cdp(self.config.cdp_url)
+            self.logger.info("Connecting to Chromium at %s", self.config.cdp_url, extra=self._log_ctx("init"))
+            try:
+                browser = await playwright.chromium.connect_over_cdp(self.config.cdp_url)
+            except Exception as exc:
+                self.logger.warning("CDP connection to %s failed: %s", self.config.cdp_url, exc)
+                # Fallback between 127.0.0.1 and localhost
+                alt_url = self.config.cdp_url.replace("127.0.0.1", "localhost") if "127.0.0.1" in self.config.cdp_url else self.config.cdp_url.replace("localhost", "127.0.0.1")
+                self.logger.info("Trying alternative connection to %s", alt_url)
+                try:
+                    browser = await playwright.chromium.connect_over_cdp(alt_url)
+                except Exception:
+                    raise SessionExit(1, "browser_connection_failed", reason=str(exc))
+            
             context = browser.contexts[0]
             page = await context.new_page()
             await self._navigate(page)

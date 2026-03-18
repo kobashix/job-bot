@@ -10,12 +10,26 @@ if (!(Get-Command python -ErrorAction SilentlyContinue)) {
     exit 1
 }
 
-# 2. Create Virtual Environment
-if (!(Test-Path .venv)) {
+# 2. Check and Create Virtual Environment
+$recreate = $false
+if (Test-Path .venv) {
+    # Check if the venv is broken (common if moved from another path)
+    try {
+        & .venv\Scripts\python.exe --version | Out-Null
+    } catch {
+        Write-Warning "Virtual environment appears broken. Recreating..."
+        $recreate = $true
+    }
+} else {
+    $recreate = $true
+}
+
+if ($recreate) {
+    if (Test-Path .venv) { Remove-Item .venv -Recurse -Force }
     Write-Host "[1/4] Creating virtual environment..." -ForegroundColor Yellow
     python -m venv .venv
 } else {
-    Write-Host "[1/4] Virtual environment already exists." -ForegroundColor Green
+    Write-Host "[1/4] Virtual environment is healthy." -ForegroundColor Green
 }
 
 # 3. Install Requirements

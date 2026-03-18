@@ -124,7 +124,7 @@ def load_config(path: Path | str) -> AppConfig:
         eeo=profile_data.get("eeo", {}),
     )
     return AppConfig(
-        cdp_url=data.get("cdp_url", "http://localhost:9223"),
+        cdp_url=data.get("cdp_url", "http://127.0.0.1:9223"),
         db_path=Path(data.get("db_path", "jobs.db")),
         answers_path=Path(data.get("answers_path", "answers.json")),
         artifact_dir=Path(data.get("artifact_dir", "artifacts")),

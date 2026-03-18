@@ -10,16 +10,17 @@ A high-performance, asynchronous job application bot for Indeed and external ATS
 
 ## Windows 11 / PowerShell Setup
 
-To install and set up everything at once on Windows 11, run this single command in PowerShell (from the project directory):
+To install and set up everything (or fix a broken environment), run this command:
 ```powershell
 Set-ExecutionPolicy Bypass -Scope Process -Force; .\setup.ps1
 ```
 
 ### Running the Bot
-Once setup is complete, you can run the bot directly:
-- **Scrape Jobs**: `.\.venv\Scripts\python.exe scrape_jobs.py "SEARCH_URL"`
-- **Apply (Single)**: `.\.venv\Scripts\python.exe unified_apply.py "JOB_URL"`
-- **Apply (Batch)**: `.\.venv\Scripts\python.exe unified_apply.py`
+1. **Launch Browser**: Run `.\launch_browser.ps1` to start Edge/Chrome with remote debugging.
+2. **Apply Jobs**:
+   - **Apply (Single)**: `.\.venv\Scripts\python.exe unified_apply.py "JOB_URL"`
+   - **Apply (Batch)**: `.\.venv\Scripts\python.exe unified_apply.py`
+   - **Scrape**: `.\.venv\Scripts\python.exe scrape_jobs.py "SEARCH_URL"`
 
 Run in **batch mode** (processes the next 10 jobs in the database):
 ```bash
