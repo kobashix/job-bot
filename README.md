@@ -8,26 +8,18 @@ A high-performance, asynchronous job application bot for Indeed and external ATS
 - **Robust Detection**: Advanced logic for detecting "Applied", "Expired", and "Non-Remote" jobs.
 - **CAPTCHA Handling**: Integrated support for resolving challenges.
 
-## Getting Started
+## Windows 11 / PowerShell Setup
 
-### 1. Setup
-- Install dependencies: `pip install -r requirements.txt`
-- Install Playwright browsers: `playwright install chromium`
-- Launch a browser with CDP enabled (default: `localhost:9223`).
-
-### 2. Usage
-
-#### Scrape Jobs
-Scrape remote jobs from Indeed and save them to the database:
-```bash
-python scrape_jobs.py "https://www.indeed.com/jobs?q=software+engineer&l=remote"
+To install and set up everything at once on Windows 11, run this single command in PowerShell (from the project directory):
+```powershell
+Set-ExecutionPolicy Bypass -Scope Process -Force; .\setup.ps1
 ```
 
-#### Apply to Jobs
-Apply to a single job URL:
-```bash
-python unified_apply.py "https://www.indeed.com/viewjob?jk=..."
-```
+### Running the Bot
+Once setup is complete, you can run the bot directly:
+- **Scrape Jobs**: `.\.venv\Scripts\python.exe scrape_jobs.py "SEARCH_URL"`
+- **Apply (Single)**: `.\.venv\Scripts\python.exe unified_apply.py "JOB_URL"`
+- **Apply (Batch)**: `.\.venv\Scripts\python.exe unified_apply.py`
 
 Run in **batch mode** (processes the next 10 jobs in the database):
 ```bash
