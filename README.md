@@ -16,7 +16,12 @@ Set-ExecutionPolicy Bypass -Scope Process -Force; .\setup.ps1
 ```
 
 ### Running the Bot
-1. **Launch Browser**: Run `.\launch_browser.ps1` to start Edge/Chrome with remote debugging.
+> [!IMPORTANT]
+> You **must** have a browser running with remote debugging enabled for the bot to work.
+
+1. **Launch Browser**: Run `.\launch_browser.ps1`. 
+   - This will open a new Edge or Chrome window.
+   - Keep this window open while the bot runs.
 2. **Apply Jobs**:
    - **Apply (Single)**: `.\.venv\Scripts\python.exe unified_apply.py "JOB_URL"`
    - **Apply (Batch)**: `.\.venv\Scripts\python.exe unified_apply.py`
